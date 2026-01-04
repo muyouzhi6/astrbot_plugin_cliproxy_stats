@@ -41,9 +41,11 @@ ANTIGRAVITY_QUOTA_GROUPS = [
 class CPAClient:
     """CLIProxyAPI 客户端"""
 
-    def __init__(self, base_url: str, password: str):
+    def __init__(self, base_url: str, password: str, verify_ssl: bool = False):
         self.base_url = base_url.rstrip('/')
         self.password = password
+        self.verify_ssl = verify_ssl
+        self._session: Optional[aiohttp.ClientSession] = None
 
     def _get_headers(self) -> dict:
         return {
@@ -51,18 +53,35 @@ class CPAClient:
             "Content-Type": "application/json"
         }
 
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """获取或创建复用的 Session"""
+        if self._session is None or self._session.closed:
+            # 根据配置决定是否验证 SSL
+            if self.verify_ssl:
+                connector = aiohttp.TCPConnector()
+            else:
+                connector = aiohttp.TCPConnector(ssl=False)
+            self._session = aiohttp.ClientSession(connector=connector)
+        return self._session
+
+    async def close(self):
+        """关闭 Session"""
+        if self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None
+
     async def get_usage(self) -> Optional[Dict[str, Any]]:
         """获取使用统计"""
         url = f"{self.base_url}/v0/management/usage"
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=self._get_headers(), timeout=30, ssl=False) as resp:
-                    if resp.status == 200:
-                        return await resp.json()
-                    else:
-                        text = await resp.text()
-                        logger.error(f"获取 usage 失败: {resp.status} - {text}")
-                        return None
+            session = await self._get_session()
+            async with session.get(url, headers=self._get_headers(), timeout=30) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                else:
+                    text = await resp.text()
+                    logger.error(f"获取 usage 失败: {resp.status} - {text}")
+                    return None
         except Exception as e:
             logger.error(f"请求 usage 接口出错: {e}")
             return None
@@ -71,14 +90,14 @@ class CPAClient:
         """获取认证文件列表"""
         url = f"{self.base_url}/v0/management/auth-files"
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=self._get_headers(), timeout=30, ssl=False) as resp:
-                    if resp.status == 200:
-                        return await resp.json()
-                    else:
-                        text = await resp.text()
-                        logger.error(f"获取 auth-files 失败: {resp.status} - {text}")
-                        return None
+            session = await self._get_session()
+            async with session.get(url, headers=self._get_headers(), timeout=30) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                else:
+                    text = await resp.text()
+                    logger.error(f"获取 auth-files 失败: {resp.status} - {text}")
+                    return None
         except Exception as e:
             logger.error(f"请求 auth-files 接口出错: {e}")
             return None
@@ -95,22 +114,22 @@ class CPAClient:
             "data": data
         }
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(api_url, headers=self._get_headers(),
-                                        json=payload, timeout=60, ssl=False) as resp:
-                    if resp.status == 200:
-                        result = await resp.json()
-                        # 解析 body
-                        if "body" in result and isinstance(result["body"], str):
-                            try:
-                                result["body"] = json.loads(result["body"])
-                            except json.JSONDecodeError:
-                                pass
-                        return result
-                    else:
-                        text = await resp.text()
-                        logger.error(f"api-call 失败: {resp.status} - {text}")
-                        return None
+            session = await self._get_session()
+            async with session.post(api_url, headers=self._get_headers(),
+                                    json=payload, timeout=60) as resp:
+                if resp.status == 200:
+                    result = await resp.json()
+                    # 解析 body（先检查类型）
+                    if "body" in result and isinstance(result["body"], str):
+                        try:
+                            result["body"] = json.loads(result["body"])
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+                    return result
+                else:
+                    text = await resp.text()
+                    logger.error(f"api-call 失败: {resp.status} - {text}")
+                    return None
         except Exception as e:
             logger.error(f"api-call 请求出错: {e}")
             return None
@@ -140,12 +159,16 @@ class Main(Star):
         self.config = config
         self.cpa_url = self.config.get("cpa_url", "")
         self.cpa_password = self.config.get("cpa_password", "")
+        self.verify_ssl = self.config.get("verify_ssl", False)
+        self._client: Optional[CPAClient] = None
 
     def _get_client(self) -> Optional[CPAClient]:
-        """获取 CPA 客户端"""
+        """获取 CPA 客户端（复用同一个实例）"""
         if not self.cpa_url or not self.cpa_password:
             return None
-        return CPAClient(self.cpa_url, self.cpa_password)
+        if self._client is None:
+            self._client = CPAClient(self.cpa_url, self.cpa_password, self.verify_ssl)
+        return self._client
 
     def _format_tokens(self, tokens: int) -> str:
         """格式化 token 数量"""
@@ -729,5 +752,8 @@ class Main(Star):
         return "\n".join(lines).rstrip()
 
     async def terminate(self):
-        """插件终止"""
+        """插件终止，关闭 HTTP 连接"""
+        if self._client:
+            await self._client.close()
+            self._client = None
         logger.info("CLIProxyAPI 统计插件已终止")

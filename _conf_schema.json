@@ -10,5 +10,11 @@
     "type": "string",
     "hint": "用于访问管理 API 的密码",
     "default": ""
+  },
+  "verify_ssl": {
+    "description": "是否验证 SSL 证书",
+    "type": "bool",
+    "hint": "如果 CPA 使用自签名证书，可以关闭此选项",
+    "default": false
   }
 }

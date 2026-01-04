@@ -1,0 +1,14 @@
+{
+  "cpa_url": {
+    "description": "CLIProxyAPI 服务地址 (如 https://example.com)",
+    "type": "string",
+    "hint": "不包含路径，只需要协议和域名",
+    "default": ""
+  },
+  "cpa_password": {
+    "description": "CLIProxyAPI 管理密码",
+    "type": "string",
+    "hint": "用于访问管理 API 的密码",
+    "default": ""
+  }
+}

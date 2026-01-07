@@ -1,16 +1,25 @@
 """
 CLIProxyAPI 额度与使用统计查询插件
 支持查看 OAuth 模型额度和当日调用统计
+输出渲染为现代卡片风格图片
 """
 
 import aiohttp
+import asyncio
 import json
+import os
 from datetime import datetime, date
 from typing import Optional, Dict, Any, List
 
 from astrbot.api.star import Star, Context
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api import logger, AstrBotConfig
+
+# 导入自定义统计卡片渲染器
+from .stats_renderer import StatsCardRenderer
+
+# 导入图片保存工具
+from astrbot.core.utils.io import save_temp_img
 
 
 # Antigravity 配额 API 配置
@@ -65,10 +74,12 @@ class CPAClient:
         return self._session
 
     async def close(self):
-        """关闭 Session"""
+        """关闭 Session 及其 Connector"""
         if self._session and not self._session.closed:
             await self._session.close()
-            self._session = None
+            # 等待 connector 完全关闭，避免资源泄漏
+            await asyncio.sleep(0.25)
+        self._session = None
 
     async def get_usage(self) -> Optional[Dict[str, Any]]:
         """获取使用统计"""
@@ -161,6 +172,103 @@ class Main(Star):
         self.cpa_password = self.config.get("cpa_password", "")
         self.verify_ssl = self.config.get("verify_ssl", False)
         self._client: Optional[CPAClient] = None
+        self._renderer: Optional[StatsCardRenderer] = None
+
+    async def _render_image(self, data: dict) -> Optional[str]:
+        """使用自定义渲染器将统计数据转换为美观的卡片图片"""
+        try:
+            # 复用渲染器实例
+            if self._renderer is None:
+                self._renderer = StatsCardRenderer()
+            img = self._renderer.render(data)
+
+            if img is None:
+                logger.warning("渲染器返回空图片")
+                return None
+
+            # 保存图片到临时目录
+            result = save_temp_img(img)
+
+            if result and os.path.exists(result):
+                file_size = os.path.getsize(result)
+                if file_size > 1024:
+                    logger.info(f"统计卡片渲染成功，路径: {result}，大小: {file_size} 字节")
+                    return result
+                else:
+                    logger.warning(f"渲染图片太小 ({file_size} 字节)")
+            else:
+                logger.warning(f"渲染图片保存失败: {result}")
+        except Exception as e:
+            logger.error(f"统计卡片渲染失败: {e}", exc_info=True)
+
+        return None
+
+    def _build_text_from_data(self, data: dict) -> Optional[str]:
+        """从数据构建纯文本（用于回退渲染）"""
+        stats_type = data.get("stats_type", "")
+        lines = []
+
+        if stats_type == "overview":
+            lines.append(f"# {data.get('title', 'CLIProxyAPI 统计')}")
+            lines.append("")
+            lines.append("## 总体统计")
+            lines.append(f"- 总请求数: **{data.get('total_requests', 0)}**")
+            lines.append(f"- 成功率: **{data.get('success_rate', 0)}%**")
+            lines.append(f"- 成功/失败: {data.get('success_count', 0)} / {data.get('failure_count', 0)}")
+            lines.append(f"- 总 Token: **{data.get('total_tokens', '0')}**")
+
+            apis = data.get("apis", [])
+            if apis:
+                lines.append("")
+                lines.append("## 各接口统计")
+                for api in apis[:8]:
+                    lines.append(f"- {api['name']}: {api['requests']} 次 / {api['tokens']}")
+
+            auth_info = data.get("auth_info")
+            if auth_info:
+                lines.append("")
+                lines.append(f"## OAuth 账号: {auth_info['active']}/{auth_info['total']} 可用")
+                for p in auth_info.get("providers", []):
+                    lines.append(f"- {p['name']}: {p['active']}/{p['total']}")
+
+        elif stats_type == "today":
+            lines.append(f"# {data.get('title', '今日统计')}")
+            lines.append(f"日期: {data.get('subtitle', '')}")
+            lines.append("")
+            lines.append(f"- 请求数: **{data.get('today_requests', 0)}**")
+            lines.append(f"- Token: **{data.get('today_tokens', '0')}**")
+
+            model_stats = data.get("model_stats")
+            if model_stats:
+                lines.append("")
+                lines.append("## 各模型详情")
+                for m in model_stats[:10]:
+                    fail_info = f" (失败{m['failed']})" if m.get('failed', 0) > 0 else ""
+                    lines.append(f"- {m['name']}: {m['requests']} 次{fail_info} / {m['tokens']}")
+
+            time_slots = data.get("time_slots")
+            if time_slots:
+                lines.append("")
+                lines.append("## 时段分布")
+                for slot in time_slots:
+                    lines.append(f"- {slot['label']}: {slot['count']}")
+
+        elif stats_type == "quota":
+            lines.append(f"# {data.get('title', 'OAuth 配额状态')}")
+            lines.append("")
+
+            for account in data.get("accounts", []):
+                lines.append(f"### {account['icon']} {account['email']}")
+                if account.get("error"):
+                    lines.append(f"  ⚠️ {account['error']}")
+                else:
+                    for q in account.get("quotas", []):
+                        lines.append(f"  - {q['icon']} {q['label']}: **{q['percent']}%** | 刷新: {q['reset_time']}")
+                lines.append("")
+
+            lines.append("> 💡 配额每日自动刷新，百分比为剩余额度")
+
+        return "\n".join(lines) if lines else None
 
     def _get_client(self) -> Optional[CPAClient]:
         """获取 CPA 客户端（复用同一个实例）"""
@@ -266,8 +374,24 @@ class Main(Star):
         subcommand = args[0].lower() if args else "overview"
 
         if subcommand in ["today", "今日", "今天"]:
+            # 构建今日统计数据
+            data = await self._build_today_data(client)
+            if data:
+                image_path = await self._render_image(data)
+                if image_path:
+                    yield event.image_result(image_path)
+                    return
+            # 后备：纯文本
             yield event.plain_result(await self._get_today_stats(client))
         else:
+            # 构建总览数据
+            data = await self._build_overview_data(client)
+            if data:
+                image_path = await self._render_image(data)
+                if image_path:
+                    yield event.image_result(image_path)
+                    return
+            # 后备：纯文本
             yield event.plain_result(await self._get_overview(client))
 
     @filter.command("cpa额度")
@@ -278,6 +402,14 @@ class Main(Star):
             yield event.plain_result("❌ 未配置 CLIProxyAPI 地址或密码，请在插件配置中设置")
             return
 
+        # 构建配额数据
+        data = await self._build_quota_data(client)
+        if data:
+            image_path = await self._render_image(data)
+            if image_path:
+                yield event.image_result(image_path)
+                return
+        # 后备：纯文本
         yield event.plain_result(await self._get_quota_status(client))
 
     @filter.command("cpa今日")
@@ -288,57 +420,52 @@ class Main(Star):
             yield event.plain_result("❌ 未配置 CLIProxyAPI 地址或密码，请在插件配置中设置")
             return
 
+        # 构建今日统计数据
+        data = await self._build_today_data(client)
+        if data:
+            image_path = await self._render_image(data)
+            if image_path:
+                yield event.image_result(image_path)
+                return
+        # 后备：纯文本
         yield event.plain_result(await self._get_today_stats(client))
 
-    async def _get_overview(self, client: CPAClient) -> str:
-        """获取总览信息"""
+    async def _build_overview_data(self, client: CPAClient) -> Optional[Dict[str, Any]]:
+        """构建总览页面的模板数据"""
         usage_data = await client.get_usage()
         auth_data = await client.get_auth_files()
 
         if not usage_data:
-            return "❌ 获取使用统计失败，请检查配置"
+            return None
 
         usage = usage_data.get("usage", {})
 
-        lines = ["📊 CLIProxyAPI 统计总览", ""]
-
-        # 总体统计
         total_requests = usage.get("total_requests", 0)
         success_count = usage.get("success_count", 0)
         failure_count = usage.get("failure_count", 0)
         total_tokens = usage.get("total_tokens", 0)
+        success_rate = round((success_count / total_requests * 100), 1) if total_requests > 0 else 0
 
-        success_rate = (success_count / total_requests * 100) if total_requests > 0 else 0
-
-        lines.append("📈 总体统计")
-        lines.append(f"  总请求数: {total_requests}")
-        lines.append(f"  成功: {success_count} | 失败: {failure_count}")
-        lines.append(f"  成功率: {success_rate:.1f}%")
-        lines.append(f"  总 Token: {self._format_tokens(total_tokens)}")
-        lines.append("")
-
-        # 各模型统计
+        # 构建 API 列表
         apis = usage.get("apis", {})
+        api_list = []
         if apis:
-            lines.append("🤖 各接口统计")
-            # 按请求数排序
             sorted_apis = sorted(apis.items(), key=lambda x: x[1].get("total_requests", 0), reverse=True)
-            for api_name, api_data in sorted_apis[:10]:  # 只显示前10个
-                req_count = api_data.get("total_requests", 0)
-                token_count = api_data.get("total_tokens", 0)
-                lines.append(f"  {api_name}")
-                lines.append(f"    请求: {req_count} | Token: {self._format_tokens(token_count)}")
-            lines.append("")
+            for api_name, api_data in sorted_apis[:8]:  # 只显示前8个
+                api_list.append({
+                    "name": api_name,
+                    "requests": api_data.get("total_requests", 0),
+                    "tokens": self._format_tokens(api_data.get("total_tokens", 0))
+                })
 
-        # OAuth 账号状态
+        # 构建认证信息
+        auth_info = None
         if auth_data and auth_data.get("files"):
             auth_files = auth_data.get("files", [])
             active_count = sum(1 for f in auth_files if not f.get("disabled", False) and not f.get("unavailable", False))
             total_auth = len(auth_files)
 
-            lines.append(f"🔑 OAuth 账号: {active_count}/{total_auth} 可用")
-
-            # 按类型分组统计
+            # 按类型分组
             type_counts: Dict[str, Dict[str, int]] = {}
             for auth in auth_files:
                 provider = auth.get("provider", auth.get("type", "unknown"))
@@ -348,48 +475,60 @@ class Main(Star):
                 if not auth.get("disabled", False) and not auth.get("unavailable", False):
                     type_counts[provider]["active"] += 1
 
+            providers = []
             for provider, counts in type_counts.items():
-                display_name = self._get_provider_display(provider)
-                lines.append(f"  {display_name}: {counts['active']}/{counts['total']}")
+                providers.append({
+                    "name": self._get_provider_display(provider),
+                    "active": counts["active"],
+                    "total": counts["total"]
+                })
 
-        return "\n".join(lines)
+            auth_info = {
+                "active": active_count,
+                "total": total_auth,
+                "providers": providers
+            }
 
-    async def _get_today_stats(self, client: CPAClient) -> str:
-        """获取今日统计"""
+        return {
+            "stats_type": "overview",
+            "title": "📊 CLIProxyAPI 统计",
+            "subtitle": "总览",
+            "total_requests": total_requests,
+            "success_count": success_count,
+            "failure_count": failure_count,
+            "success_rate": success_rate,
+            "total_tokens": self._format_tokens(total_tokens),
+            "apis": api_list,
+            "auth_info": auth_info
+        }
+
+    async def _build_today_data(self, client: CPAClient) -> Optional[Dict[str, Any]]:
+        """构建今日统计的模板数据"""
         usage_data = await client.get_usage()
 
         if not usage_data:
-            return "❌ 获取使用统计失败，请检查配置"
+            return None
 
         usage = usage_data.get("usage", {})
         today = date.today().isoformat()
 
-        lines = ["📅 今日使用统计", f"日期: {today}", ""]
-
-        # 今日请求数
         requests_by_day = usage.get("requests_by_day", {})
         tokens_by_day = usage.get("tokens_by_day", {})
 
         today_requests = requests_by_day.get(today, 0)
         today_tokens = tokens_by_day.get(today, 0)
 
-        lines.append(f"📊 今日总计")
-        lines.append(f"  请求数: {today_requests}")
-        lines.append(f"  Token: {self._format_tokens(today_tokens)}")
-        lines.append("")
-
         # 各模型今日统计
         apis = usage.get("apis", {})
+        model_stats = []
+        today_by_hour: Dict[int, int] = {h: 0 for h in range(24)}
+
         if apis:
-            lines.append("🤖 今日各模型详情")
-
             model_today_stats: List[tuple] = []
-
             for api_name, api_data in apis.items():
                 models = api_data.get("models", {})
                 for model_name, model_data in models.items():
                     details = model_data.get("details", [])
-                    # 筛选今日的请求
                     today_details = [d for d in details if d.get("timestamp", "").startswith(today)]
                     if today_details:
                         today_req = len(today_details)
@@ -397,130 +536,166 @@ class Main(Star):
                         today_failed = sum(1 for d in today_details if d.get("failed", False))
                         model_today_stats.append((model_name, today_req, today_tok, today_failed))
 
-            # 按请求数排序
+                        # 统计小时分布
+                        for d in today_details:
+                            timestamp = d.get("timestamp", "")
+                            try:
+                                hour = int(timestamp[11:13])
+                                today_by_hour[hour] += 1
+                            except (ValueError, IndexError):
+                                pass
+
             model_today_stats.sort(key=lambda x: x[1], reverse=True)
+            for model_name, req_count, tok_count, fail_count in model_today_stats[:10]:
+                model_stats.append({
+                    "name": model_name,
+                    "requests": req_count,
+                    "tokens": self._format_tokens(tok_count),
+                    "failed": fail_count
+                })
 
-            if model_today_stats:
-                for model_name, req_count, tok_count, fail_count in model_today_stats[:15]:
-                    fail_info = f" (失败{fail_count})" if fail_count > 0 else ""
-                    lines.append(f"  {model_name}")
-                    lines.append(f"    请求: {req_count}{fail_info} | Token: {self._format_tokens(tok_count)}")
-            else:
-                lines.append("  今日暂无使用记录")
+        # 时段统计
+        time_slots = [
+            {"label": "凌晨 0-6", "count": sum(today_by_hour[h] for h in range(0, 6))},
+            {"label": "上午 6-12", "count": sum(today_by_hour[h] for h in range(6, 12))},
+            {"label": "下午 12-18", "count": sum(today_by_hour[h] for h in range(12, 18))},
+            {"label": "晚间 18-24", "count": sum(today_by_hour[h] for h in range(18, 24))}
+        ]
 
-        # 按小时分布（从 details 中按今天的 timestamp 统计）
-        today_by_hour: Dict[int, int] = {h: 0 for h in range(24)}
-        for api_name, api_data in apis.items():
-            models = api_data.get("models", {})
-            for model_name, model_data in models.items():
-                details = model_data.get("details", [])
-                for d in details:
-                    timestamp = d.get("timestamp", "")
-                    if timestamp.startswith(today):
-                        try:
-                            # 解析小时，timestamp 格式类似 "2026-01-04T14:30:00Z"
-                            hour = int(timestamp[11:13])
-                            today_by_hour[hour] += 1
-                        except (ValueError, IndexError):
-                            pass
+        return {
+            "stats_type": "today",
+            "title": "📅 今日使用统计",
+            "subtitle": today,
+            "today_requests": today_requests,
+            "today_tokens": self._format_tokens(today_tokens),
+            "model_stats": model_stats if model_stats else None,
+            "time_slots": time_slots if sum(s["count"] for s in time_slots) > 0 else None
+        }
 
-        total_hourly = sum(today_by_hour.values())
-        if total_hourly > 0:
-            lines.append("")
-            lines.append("⏰ 今日各时段请求")
-            # 简化显示：分几个时段
-            night = sum(today_by_hour[h] for h in range(0, 6))
-            morning = sum(today_by_hour[h] for h in range(6, 12))
-            afternoon = sum(today_by_hour[h] for h in range(12, 18))
-            evening = sum(today_by_hour[h] for h in range(18, 24))
-
-            lines.append(f"  凌晨(0-6): {night} | 上午(6-12): {morning}")
-            lines.append(f"  下午(12-18): {afternoon} | 晚间(18-24): {evening}")
-
-        return "\n".join(lines)
-
-    async def _get_auth_status(self, client: CPAClient) -> str:
-        """获取 OAuth 账号状态"""
+    async def _build_quota_data(self, client: CPAClient) -> Optional[Dict[str, Any]]:
+        """构建配额页面的模板数据"""
         auth_data = await client.get_auth_files()
 
         if not auth_data:
-            return "❌ 获取账号状态失败，请检查配置"
+            return None
 
         auth_files = auth_data.get("files", [])
-
         if not auth_files:
-            return "📭 暂无 OAuth 账号"
+            return None
 
-        lines = ["🔑 OAuth 账号状态", ""]
+        # 筛选 Antigravity 账号
+        antigravity_auths = [
+            auth for auth in auth_files
+            if auth.get("provider", auth.get("type", "")).lower() == "antigravity"
+        ]
 
-        # 按类型分组
-        groups: Dict[str, List[Dict]] = {}
-        for auth in auth_files:
-            provider = auth.get("provider", auth.get("type", "unknown"))
-            if provider not in groups:
-                groups[provider] = []
-            groups[provider].append(auth)
+        if not antigravity_auths:
+            return None
 
-        for provider, auths in groups.items():
-            display_name = self._get_provider_display(provider)
-            active = [a for a in auths if not a.get("disabled", False) and not a.get("unavailable", False)]
+        accounts = []
+        for auth in antigravity_auths:
+            auth_index = auth.get("auth_index", "")
+            email = auth.get("email", "")
+            name = auth.get("name", auth.get("id", "未知"))
+            disabled = auth.get("disabled", False)
+            unavailable = auth.get("unavailable", False)
 
-            lines.append(f"【{display_name}】 {len(active)}/{len(auths)} 可用")
+            icon = "❌" if (disabled or unavailable) else "✅"
+            display = email if email else name
+            if len(display) > 30:
+                display = display[:27] + "..."
 
-            for auth in auths:
-                name = auth.get("name", auth.get("id", "未知"))
-                email = auth.get("email", "")
-                status = auth.get("status", "")
-                disabled = auth.get("disabled", False)
-                unavailable = auth.get("unavailable", False)
+            account_data = {
+                "icon": icon,
+                "email": display,
+                "error": None,
+                "quotas": []
+            }
 
-                # 状态图标
-                if disabled or unavailable:
-                    icon = "❌"
-                elif status == "active":
-                    icon = "✅"
-                elif status == "disabled":
-                    icon = "🚫"
-                elif status == "cooling":
-                    icon = "❄️"
+            if not auth_index:
+                account_data["error"] = "无法获取配额（缺少 auth_index）"
+                accounts.append(account_data)
+                continue
+
+            if disabled or unavailable:
+                account_data["error"] = "账号已禁用或不可用"
+                accounts.append(account_data)
+                continue
+
+            # 获取配额信息
+            quota_data = await client.get_antigravity_quota(auth_index)
+
+            if not quota_data:
+                account_data["error"] = "获取配额失败"
+                accounts.append(account_data)
+                continue
+
+            models = quota_data.get("models", {})
+            if not models:
+                account_data["error"] = "无可用模型"
+                accounts.append(account_data)
+                continue
+
+            quota_groups = self._parse_antigravity_quota(models)
+            if not quota_groups:
+                account_data["error"] = "无配额信息"
+                accounts.append(account_data)
+                continue
+
+            for group in quota_groups:
+                percent = group["remaining_percent"]
+                reset_time = self._format_reset_time(group.get("reset_time"))
+                label = group["label"]
+
+                # 配额状态
+                if percent >= 80:
+                    status_icon = "🟢"
+                    color = "#10b981"
+                    level = "high"
+                elif percent >= 50:
+                    status_icon = "🟡"
+                    color = "#f59e0b"
+                    level = "medium"
+                elif percent >= 20:
+                    status_icon = "🟠"
+                    color = "#f97316"
+                    level = "medium"
                 else:
-                    icon = "⚪"
+                    status_icon = "🔴"
+                    color = "#ef4444"
+                    level = "low"
 
-                display = email if email else name
-                # 截断过长的名称
-                if len(display) > 30:
-                    display = display[:27] + "..."
+                account_data["quotas"].append({
+                    "label": label,
+                    "icon": status_icon,
+                    "percent": percent,
+                    "color": color,
+                    "level": level,
+                    "reset_time": reset_time
+                })
 
-                status_msg = auth.get("status_message", "")
-                if status_msg and len(status_msg) > 40:
-                    status_msg = status_msg[:37] + "..."
+            accounts.append(account_data)
 
-                line = f"  {icon} {display}"
-                if status_msg:
-                    line += f" ({status_msg})"
-                lines.append(line)
+        return {
+            "stats_type": "quota",
+            "title": "📊 OAuth 配额状态",
+            "subtitle": "Antigravity 账号",
+            "accounts": accounts
+        }
 
-                # 显示账号类型信息（如果有）
-                account_type = auth.get("account_type", "")
-                account = auth.get("account", "")
-                if account_type or account:
-                    extra = []
-                    if account_type:
-                        extra.append(account_type)
-                    if account:
-                        extra.append(account)
-                    lines.append(f"      类型: {' | '.join(extra)}")
+    async def _get_overview(self, client: CPAClient) -> str:
+        """获取总览信息（复用数据构建逻辑）"""
+        data = await self._build_overview_data(client)
+        if not data:
+            return "❌ 获取使用统计失败，请检查配置"
+        return self._build_text_from_data(data) or "❌ 数据格式化失败"
 
-                # 显示 ID Token 信息（Codex）
-                id_token = auth.get("id_token", {})
-                if id_token:
-                    plan_type = id_token.get("plan_type", "")
-                    if plan_type:
-                        lines.append(f"      套餐: {plan_type}")
-
-            lines.append("")
-
-        return "\n".join(lines).rstrip()
+    async def _get_today_stats(self, client: CPAClient) -> str:
+        """获取今日统计（复用数据构建逻辑）"""
+        data = await self._build_today_data(client)
+        if not data:
+            return "❌ 获取使用统计失败，请检查配置"
+        return self._build_text_from_data(data) or "❌ 数据格式化失败"
 
     async def _get_quota_status(self, client: CPAClient) -> str:
         """获取 OAuth 账号配额状态（实时从 API 获取）"""
@@ -616,138 +791,6 @@ class Main(Star):
             lines.append("")
 
         lines.append("💡 配额每日自动刷新，百分比为剩余额度")
-
-        return "\n".join(lines).rstrip()
-
-    async def _get_auth_status_with_usage(self, client: CPAClient) -> str:
-        """获取 OAuth 账号状态，并包含各凭证的使用量统计"""
-        auth_data = await client.get_auth_files()
-        usage_data = await client.get_usage()
-
-        if not auth_data:
-            return "❌ 获取账号状态失败，请检查配置"
-
-        auth_files = auth_data.get("files", [])
-
-        if not auth_files:
-            return "📭 暂无 OAuth 账号"
-
-        # 构建凭证 ID 到使用量的映射
-        auth_usage: Dict[str, Dict[str, Any]] = {}
-        if usage_data:
-            usage = usage_data.get("usage", {})
-            apis = usage.get("apis", {})
-            today = date.today().isoformat()
-
-            for api_name, api_data in apis.items():
-                models = api_data.get("models", {})
-                for model_name, model_data in models.items():
-                    details = model_data.get("details", [])
-                    for detail in details:
-                        auth_index = detail.get("auth_index", "")
-                        if auth_index:
-                            if auth_index not in auth_usage:
-                                auth_usage[auth_index] = {
-                                    "total_requests": 0,
-                                    "total_tokens": 0,
-                                    "today_requests": 0,
-                                    "today_tokens": 0,
-                                    "failed": 0
-                                }
-                            auth_usage[auth_index]["total_requests"] += 1
-                            tokens = detail.get("tokens", {}).get("total_tokens", 0)
-                            auth_usage[auth_index]["total_tokens"] += tokens
-
-                            if detail.get("failed", False):
-                                auth_usage[auth_index]["failed"] += 1
-
-                            timestamp = detail.get("timestamp", "")
-                            if timestamp.startswith(today):
-                                auth_usage[auth_index]["today_requests"] += 1
-                                auth_usage[auth_index]["today_tokens"] += tokens
-
-        lines = ["🔑 OAuth 账号状态与使用量", ""]
-
-        # 按类型分组
-        groups: Dict[str, List[Dict]] = {}
-        for auth in auth_files:
-            provider = auth.get("provider", auth.get("type", "unknown"))
-            if provider not in groups:
-                groups[provider] = []
-            groups[provider].append(auth)
-
-        for provider, auths in groups.items():
-            display_name = self._get_provider_display(provider)
-            active = [a for a in auths if not a.get("disabled", False) and not a.get("unavailable", False)]
-
-            lines.append(f"【{display_name}】 {len(active)}/{len(auths)} 可用")
-
-            for auth in auths:
-                auth_index = auth.get("auth_index", "")
-                email = auth.get("email", "")
-                name = auth.get("name", auth.get("id", "未知"))
-                status = auth.get("status", "")
-                disabled = auth.get("disabled", False)
-                unavailable = auth.get("unavailable", False)
-
-                # 状态图标
-                if disabled or unavailable:
-                    icon = "❌"
-                elif status == "active":
-                    icon = "✅"
-                elif status == "disabled":
-                    icon = "🚫"
-                elif status == "cooling":
-                    icon = "❄️"
-                else:
-                    icon = "⚪"
-
-                display = email if email else name
-                # 截断过长的名称
-                if len(display) > 25:
-                    display = display[:22] + "..."
-
-                status_msg = auth.get("status_message", "")
-
-                line = f"  {icon} {display}"
-                if status_msg:
-                    if len(status_msg) > 30:
-                        status_msg = status_msg[:27] + "..."
-                    line += f" ({status_msg})"
-                lines.append(line)
-
-                # 显示使用量（如果有）
-                if auth_index and auth_index in auth_usage:
-                    u = auth_usage[auth_index]
-                    today_info = ""
-                    if u["today_requests"] > 0:
-                        today_info = f" | 今日: {u['today_requests']}次/{self._format_tokens(u['today_tokens'])}"
-                    fail_info = f" | 失败: {u['failed']}" if u["failed"] > 0 else ""
-                    lines.append(f"      用量: {u['total_requests']}次/{self._format_tokens(u['total_tokens'])}{today_info}{fail_info}")
-
-                # 显示账号类型信息
-                account_type = auth.get("account_type", "")
-                id_token = auth.get("id_token", {})
-                if id_token:
-                    plan_type = id_token.get("plan_type", "")
-                    if plan_type:
-                        lines.append(f"      套餐: {plan_type}")
-
-                # 显示最后刷新时间
-                last_refresh = auth.get("last_refresh", "")
-                if last_refresh:
-                    try:
-                        # 解析 ISO 格式时间
-                        if "T" in last_refresh:
-                            dt = datetime.fromisoformat(last_refresh.replace("Z", "+00:00"))
-                            lines.append(f"      刷新: {dt.strftime('%m-%d %H:%M')}")
-                    except Exception:
-                        pass
-
-            lines.append("")
-
-        # 添加说明
-        lines.append("💡 说明: CPA 使用被动式额度管理，状态在请求触发限流后更新")
 
         return "\n".join(lines).rstrip()
 

@@ -83,10 +83,22 @@ class StatsCardRenderer:
         "accent_yellow": (234, 179, 8),         # 警告 - 黄
         "accent_orange": (249, 115, 22),        # 橙色
         "accent_red": (239, 68, 68),            # 错误 - 红
-        "accent_purple": (168, 85, 247),        # 紫色
+        "accent_purple": (168, 85, 247),        # 紫色 - Antigravity
         "accent_cyan": (34, 211, 238),          # 青色
+        "accent_indigo": (99, 102, 241),        # 靛蓝色 - GeminiCLI
         "progress_bg": (30, 41, 59),            # 进度条背景
         "divider": (71, 85, 105),               # 分割线
+    }
+
+    # 凭证类型颜色映射
+    PROVIDER_COLORS = {
+        "antigravity": (168, 85, 247),   # 紫色
+        "gemini": (99, 102, 241),        # 靛蓝色
+        "gemini-cli": (99, 102, 241),    # 靛蓝色 (CPA 内部使用的名称)
+        "claude": (249, 115, 22),        # 橙色
+        "codex": (16, 185, 129),         # 翠绿色
+        "iflow": (6, 182, 212),          # 青色
+        "qwen": (236, 72, 153),          # 粉色
     }
 
     # 高清渲染缩放倍数（2x 渲染后缩小，提高清晰度）
@@ -492,22 +504,33 @@ class StatsCardRenderer:
         return self._downscale_image(img)
 
     def render_quota(self, data: Dict[str, Any]) -> Image.Image:
-        """渲染配额状态卡片"""
-        base_width = 560  # 加宽卡片
+        """渲染配额状态卡片（支持多凭证类型）"""
+        base_width = 580  # 加宽卡片以容纳凭证标签
         scale = self.SCALE_FACTOR
 
         accounts = data.get("accounts", [])
 
-        # 计算高度（增加每个配额项的高度以容纳两行）
-        base_height = 80
+        # 按凭证类型分组账号
+        provider_accounts: Dict[str, List[Dict[str, Any]]] = {}
         for account in accounts:
-            base_height += 50
-            if account.get("error"):
-                base_height += 30
-            else:
-                base_height += len(account.get("quotas", [])) * 56  # 增加每项高度
-            base_height += 16
-        base_height += 60
+            provider = account.get("provider", "unknown")
+            if provider not in provider_accounts:
+                provider_accounts[provider] = []
+            provider_accounts[provider].append(account)
+
+        # 计算高度
+        base_height = 80  # 标题区域
+        for provider, accs in provider_accounts.items():
+            base_height += 40  # 凭证类型标题
+            for account in accs:
+                base_height += 54  # 账号头部（含凭证标签）
+                if account.get("error"):
+                    base_height += 30
+                else:
+                    base_height += len(account.get("quotas", [])) * 52
+                base_height += 12
+            base_height += 16  # 分组间距
+        base_height += 50  # 底部提示
 
         width = base_width * scale
         height = base_height * scale
@@ -517,80 +540,107 @@ class StatsCardRenderer:
         draw = ImageDraw.Draw(img)
 
         font_title = get_font(24 * scale)
+        font_section = get_font(18 * scale)
         font_medium = get_font(16 * scale)
         font_small = get_font(14 * scale)
         font_tiny = get_font(12 * scale)
+        font_badge = get_font(10 * scale)
 
         y = padding
 
         # 标题
         draw.text((padding, y), data.get("title", "OAuth 配额状态"),
                   fill=self.COLORS["text_primary"], font=font_title)
-        y += 50 * scale
 
-        for account in accounts:
-            # 账号卡片
-            quotas = account.get("quotas", [])
-            card_height = 44 * scale if account.get("error") else (44 + len(quotas) * 52) * scale
+        # 副标题（凭证统计摘要）
+        subtitle = data.get("subtitle", "")
+        if subtitle:
+            draw.text((padding, y + 34 * scale), subtitle,
+                      fill=self.COLORS["text_secondary"], font=font_small)
+        y += 60 * scale
 
-            self._draw_rounded_rect(draw,
-                (padding, y, width - padding, y + card_height),
-                12 * scale, self.COLORS["card_bg"], self.COLORS["card_border"])
+        # 按凭证类型渲染
+        for provider, accs in provider_accounts.items():
+            provider_color = self.PROVIDER_COLORS.get(provider, self.COLORS["accent_blue"])
+            provider_name = accs[0].get("provider_name", provider.title()) if accs else provider.title()
+            provider_icon = accs[0].get("provider_icon", "📦") if accs else "📦"
 
-            # 账号头部
-            icon = account.get("icon", "")
-            email = account.get("email", "")
+            # 凭证类型分割线和标题
+            draw.line([(padding, y), (width - padding, y)], fill=provider_color, width=2 * scale)
+            section_title = f"{provider_icon} {provider_name}"
+            draw.text((padding, y + 8 * scale), section_title,
+                      fill=provider_color, font=font_section)
+            y += 36 * scale
 
-            icon_color = self.COLORS["accent_green"] if icon == "✅" else self.COLORS["accent_red"]
-            draw.ellipse([padding + 16 * scale, y + 14 * scale, padding + 28 * scale, y + 26 * scale],
-                        fill=icon_color)
-            draw.text((padding + 36 * scale, y + 12 * scale), email,
-                      fill=self.COLORS["text_primary"], font=font_medium)
+            for account in accs:
+                # 账号卡片
+                quotas = account.get("quotas", [])
+                card_height = 48 * scale if account.get("error") else (48 + len(quotas) * 50) * scale
 
-            y += 44 * scale
+                # 绘制卡片边框，使用凭证类型颜色
+                self._draw_rounded_rect(draw,
+                    (padding, y, width - padding, y + card_height),
+                    12 * scale, self.COLORS["card_bg"], provider_color)
 
-            if account.get("error"):
-                draw.text((padding + 36 * scale, y - 20 * scale), f"⚠️ {account['error']}",
-                          fill=self.COLORS["accent_yellow"], font=font_small)
-            else:
-                for quota in quotas:
-                    label = quota.get("label", "")
-                    percent = quota.get("percent", 0)
-                    reset_time = quota.get("reset_time", "")
+                # 账号头部
+                icon = account.get("icon", "")
+                email = account.get("email", "")
 
-                    # 确定颜色
-                    if percent >= 80:
-                        bar_color = self.COLORS["accent_green"]
-                    elif percent >= 50:
-                        bar_color = self.COLORS["accent_yellow"]
-                    elif percent >= 20:
-                        bar_color = self.COLORS["accent_orange"]
-                    else:
-                        bar_color = self.COLORS["accent_red"]
+                # 状态指示点
+                icon_color = self.COLORS["accent_green"] if icon == "✅" else self.COLORS["accent_red"]
+                draw.ellipse([padding + 16 * scale, y + 16 * scale, padding + 28 * scale, y + 28 * scale],
+                            fill=icon_color)
 
-                    # 第一行：标签 + 进度条 + 百分比
-                    draw.text((padding + 20 * scale, y), label,
-                              fill=self.COLORS["text_secondary"], font=font_small)
+                # 邮箱/名称
+                draw.text((padding + 38 * scale, y + 14 * scale), email,
+                          fill=self.COLORS["text_primary"], font=font_medium)
 
-                    # 进度条（位置调整）
-                    bar_x = padding + 140 * scale
-                    bar_width_val = 200 * scale
-                    self._draw_progress_bar(draw, bar_x, y + 4 * scale, bar_width_val, 14 * scale, percent, bar_color)
+                y += 44 * scale
 
-                    # 百分比（紧跟进度条后面）
-                    percent_text = f"{percent}%"
-                    draw.text((bar_x + bar_width_val + 12 * scale, y), percent_text,
-                              fill=bar_color, font=font_small)
+                if account.get("error"):
+                    draw.text((padding + 38 * scale, y - 18 * scale), f"⚠️ {account['error']}",
+                              fill=self.COLORS["accent_yellow"], font=font_small)
+                else:
+                    for quota in quotas:
+                        label = quota.get("label", "")
+                        percent = quota.get("percent", 0)
+                        reset_time = quota.get("reset_time", "")
 
-                    # 第二行：刷新时间（右对齐，在进度条下方）
-                    reset_text = f"刷新: {reset_time}"
-                    reset_width = self._get_text_size(draw, reset_text, font_tiny)[0]
-                    draw.text((width - padding - reset_width - 20 * scale, y + 24 * scale),
-                              reset_text, fill=self.COLORS["text_muted"], font=font_tiny)
+                        # 确定颜色
+                        if percent >= 80:
+                            bar_color = self.COLORS["accent_green"]
+                        elif percent >= 50:
+                            bar_color = self.COLORS["accent_yellow"]
+                        elif percent >= 20:
+                            bar_color = self.COLORS["accent_orange"]
+                        else:
+                            bar_color = self.COLORS["accent_red"]
 
-                    y += 50 * scale
+                        # 第一行：标签 + 进度条 + 百分比
+                        draw.text((padding + 20 * scale, y), label,
+                                  fill=self.COLORS["text_secondary"], font=font_small)
 
-            y += 16 * scale
+                        # 进度条（位置调整）
+                        bar_x = padding + 150 * scale
+                        bar_width_val = 200 * scale
+                        self._draw_progress_bar(draw, bar_x, y + 4 * scale, bar_width_val, 14 * scale, percent, bar_color)
+
+                        # 百分比（紧跟进度条后面）
+                        percent_text = f"{percent}%"
+                        draw.text((bar_x + bar_width_val + 12 * scale, y), percent_text,
+                                  fill=bar_color, font=font_small)
+
+                        # 第二行：刷新时间（右对齐，在进度条下方）
+                        reset_text = f"刷新: {reset_time}"
+                        reset_width = self._get_text_size(draw, reset_text, font_tiny)[0]
+                        draw.text((width - padding - reset_width - 20 * scale, y + 22 * scale),
+                                  reset_text, fill=self.COLORS["text_muted"], font=font_tiny)
+
+                        y += 48 * scale
+
+                y += 14 * scale
+
+            y += 8 * scale  # 凭证类型分组间距
 
         # 底部提示
         tip_text = "💡 配额每日自动刷新，百分比为剩余额度"

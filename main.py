@@ -22,21 +22,73 @@ from .stats_renderer import StatsCardRenderer
 from astrbot.core.utils.io import save_temp_img
 
 
-# Antigravity 配额 API 配置
+# Antigravity 配额 API (使用 fetchAvailableModels)
 ANTIGRAVITY_QUOTA_URLS = [
     "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
     "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels",
     "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels"
 ]
 
+# GeminiCLI 配额 API (使用 retrieveUserQuota，需要传递 project 参数)
+GEMINI_CLI_QUOTA_URL = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota"
+
+# GeminiCLI 简化请求头 (WebUI 只使用 Authorization 和 Content-Type)
+GEMINI_CLI_QUOTA_HEADERS = {
+    "Authorization": "Bearer $TOKEN$",
+    "Content-Type": "application/json"
+}
+
+
+def extract_project_from_filename(filename: str) -> Optional[str]:
+    """从 GeminiCLI 凭证文件名中提取 project 名称
+
+    文件名格式: gemini-{email}-{project}.json
+    例如: gemini-user@gmail.com-focused-brace-480503-c1.json -> focused-brace-480503-c1
+    """
+    import re
+    if not filename:
+        return None
+
+    # 移除 .json 后缀
+    name = filename.rstrip('.json') if filename.endswith('.json') else filename
+
+    # 匹配 gemini-{email}-{project} 格式
+    # email 包含 @ 符号，project 是最后一个 @ 后面的部分去掉 email 域名
+    match = re.match(r'^gemini-[^@]+@[^-]+-(.+)$', name)
+    if match:
+        return match.group(1)
+
+    # 备用方案：找最后一个 @ 后面的部分，然后取第一个 - 之后的所有内容
+    if '@' in name and '-' in name:
+        at_pos = name.rfind('@')
+        after_at = name[at_pos+1:]
+        dash_pos = after_at.find('-')
+        if dash_pos != -1:
+            return after_at[dash_pos+1:]
+
+    return None
+
+# Antigravity 请求头
 ANTIGRAVITY_REQUEST_HEADERS = {
     "Authorization": "Bearer $TOKEN$",
     "Content-Type": "application/json",
     "User-Agent": "antigravity/1.11.5 windows/amd64"
 }
 
-# 模型分组配置
-ANTIGRAVITY_QUOTA_GROUPS = [
+# GeminiCLI 请求头
+GEMINI_CLI_REQUEST_HEADERS = {
+    "Authorization": "Bearer $TOKEN$",
+    "Content-Type": "application/json",
+    "User-Agent": "google-api-nodejs-client/9.15.1",
+    "X-Goog-Api-Client": "gl-node/22.17.0",
+    "Client-Metadata": "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI"
+}
+
+# 支持配额查询的凭证类型 (gemini-cli 是 CPA 内部转换后的名称)
+QUOTA_SUPPORTED_PROVIDERS = ["antigravity", "gemini", "gemini-cli"]
+
+# 模型分组配置 (Antigravity 格式)
+QUOTA_GROUPS = [
     {"id": "claude-gpt", "label": "Claude/GPT", "identifiers": ["claude-sonnet-4-5-thinking", "claude-opus-4-5-thinking", "claude-sonnet-4-5", "gpt-oss-120b-medium"]},
     {"id": "gemini-3-pro", "label": "Gemini 3 Pro", "identifiers": ["gemini-3-pro-high", "gemini-3-pro-low"]},
     {"id": "gemini-2-5-flash", "label": "Gemini 2.5 Flash", "identifiers": ["gemini-2.5-flash", "gemini-2.5-flash-thinking"]},
@@ -45,6 +97,26 @@ ANTIGRAVITY_QUOTA_GROUPS = [
     {"id": "gemini-3-flash", "label": "Gemini 3 Flash", "identifiers": ["gemini-3-flash"]},
     {"id": "gemini-image", "label": "Gemini 3 Pro Image", "identifiers": ["gemini-3-pro-image"]}
 ]
+
+# GeminiCLI 模型分组配置 (buckets 格式, 使用 retrieveUserQuota API)
+GEMINI_CLI_QUOTA_GROUPS = [
+    {"id": "gemini-2-5-flash-series", "label": "Gemini 2.5 Flash Series", "identifiers": ["gemini-2.5-flash", "gemini-2.5-flash-lite"]},
+    {"id": "gemini-2-5-pro", "label": "Gemini 2.5 Pro", "identifiers": ["gemini-2.5-pro"]},
+    {"id": "gemini-3-flash-preview", "label": "Gemini 3 Flash Preview", "identifiers": ["gemini-3-flash-preview"]},
+    {"id": "gemini-3-pro-preview", "label": "Gemini 3 Pro Preview", "identifiers": ["gemini-3-pro-preview"]},
+    {"id": "gemini-2-0-flash", "label": "Gemini 2.0 Flash", "identifiers": ["gemini-2.0-flash"]},
+]
+
+# 凭证类型显示名称和图标
+PROVIDER_INFO = {
+    "antigravity": {"name": "Antigravity", "icon": "🚀", "color": "#8b5cf6"},
+    "gemini": {"name": "GeminiCLI", "icon": "💎", "color": "#3b82f6"},
+    "gemini-cli": {"name": "GeminiCLI", "icon": "💎", "color": "#3b82f6"},  # CPA 内部使用的名称
+    "claude": {"name": "Claude", "icon": "🤖", "color": "#f59e0b"},
+    "codex": {"name": "Codex", "icon": "🔮", "color": "#10b981"},
+    "iflow": {"name": "iFlow", "icon": "🌊", "color": "#06b6d4"},
+    "qwen": {"name": "Qwen", "icon": "🌙", "color": "#ec4899"}
+}
 
 
 class CPAClient:
@@ -145,8 +217,113 @@ class CPAClient:
             logger.error(f"api-call 请求出错: {e}")
             return None
 
-    async def get_antigravity_quota(self, auth_index: str) -> Optional[Dict[str, Any]]:
+    async def get_antigravity_quota(self, auth_index: str) -> Dict[str, Any]:
         """获取 Antigravity 账号的配额信息"""
+        return await self.get_google_quota(auth_index, "antigravity")
+
+    async def get_gemini_cli_quota(self, auth_index: str, project: str) -> Dict[str, Any]:
+        """获取 GeminiCLI 账号的配额信息
+
+        Args:
+            auth_index: 凭证索引
+            project: 项目名称（从文件名中提取）
+
+        Returns:
+            Dict with keys:
+                - "success": bool - 是否成功
+                - "buckets": List - 配额桶列表（仅在成功时存在）
+                - "error": str - 错误信息（仅在失败时存在）
+                - "error_code": int - HTTP 错误码（仅在失败时存在）
+        """
+        if not project:
+            return {
+                "success": False,
+                "error": "无法提取项目名称",
+                "error_code": 0
+            }
+
+        result = await self.api_call(
+            auth_index=auth_index,
+            method="POST",
+            url=GEMINI_CLI_QUOTA_URL,
+            header=GEMINI_CLI_QUOTA_HEADERS,
+            data=json.dumps({"project": project})
+        )
+
+        if result:
+            status_code = result.get("status_code", 0)
+            if status_code == 200:
+                body = result.get("body", {})
+                # body 可能是字符串，需要解析
+                if isinstance(body, str):
+                    try:
+                        body = json.loads(body)
+                    except json.JSONDecodeError:
+                        body = {}
+                # GeminiCLI API 返回 buckets 数组
+                if isinstance(body, dict) and "buckets" in body:
+                    return {"success": True, "buckets": body.get("buckets", [])}
+                return {"success": True, "buckets": []}
+            elif status_code == 403:
+                return {
+                    "success": False,
+                    "error": "权限不足",
+                    "error_code": 403
+                }
+            else:
+                body = result.get("body", {})
+                if isinstance(body, str):
+                    try:
+                        body = json.loads(body)
+                    except json.JSONDecodeError:
+                        body = {}
+                error_msg = f"HTTP {status_code}"
+                if isinstance(body, dict) and "error" in body:
+                    error_msg = body.get("error", {}).get("message", error_msg)
+                return {
+                    "success": False,
+                    "error": error_msg,
+                    "error_code": status_code
+                }
+
+        return {
+            "success": False,
+            "error": "获取配额失败",
+            "error_code": 0
+        }
+
+    async def get_google_quota(self, auth_index: str, provider: str = "antigravity",
+                               filename: str = "") -> Dict[str, Any]:
+        """获取 Google Cloud Code 账号的配额信息 (支持 Antigravity 和 GeminiCLI)
+
+        Args:
+            auth_index: 凭证索引
+            provider: 凭证类型 (antigravity, gemini, gemini-cli)
+            filename: 凭证文件名（GeminiCLI 需要从中提取 project）
+
+        Returns:
+            Dict with keys:
+                - "success": bool - 是否成功
+                - "models": Dict - 配额模型数据（Antigravity 格式，仅在成功时存在）
+                - "buckets": List - 配额桶列表（GeminiCLI 格式，仅在成功时存在）
+                - "error": str - 错误信息（仅在失败时存在）
+                - "error_code": int - HTTP 错误码（仅在失败时存在）
+        """
+        # GeminiCLI 使用 retrieveUserQuota 端点
+        if provider.lower() in ("gemini", "gemini-cli"):
+            project = extract_project_from_filename(filename)
+            if not project:
+                return {
+                    "success": False,
+                    "error": "无法从文件名提取项目名称",
+                    "error_code": 0
+                }
+            return await self.get_gemini_cli_quota(auth_index, project)
+
+        # Antigravity 使用 fetchAvailableModels 端点
+        last_error = None
+        last_status_code = None
+
         for quota_url in ANTIGRAVITY_QUOTA_URLS:
             result = await self.api_call(
                 auth_index=auth_index,
@@ -155,11 +332,31 @@ class CPAClient:
                 header=ANTIGRAVITY_REQUEST_HEADERS,
                 data="{}"
             )
-            if result and result.get("status_code") == 200:
-                body = result.get("body", {})
-                if isinstance(body, dict) and "models" in body:
-                    return body
-        return None
+            if result:
+                status_code = result.get("status_code", 0)
+                if status_code == 200:
+                    body = result.get("body", {})
+                    if isinstance(body, dict) and "models" in body:
+                        return {"success": True, "models": body.get("models", {})}
+                elif status_code == 403:
+                    return {
+                        "success": False,
+                        "error": "权限不足",
+                        "error_code": 403
+                    }
+                else:
+                    last_status_code = status_code
+                    body = result.get("body", {})
+                    if isinstance(body, dict):
+                        last_error = body.get("error", {}).get("message", f"HTTP {status_code}")
+                    else:
+                        last_error = f"HTTP {status_code}"
+
+        return {
+            "success": False,
+            "error": last_error or "获取配额失败",
+            "error_code": last_status_code or 0
+        }
 
 
 class Main(Star):
@@ -298,11 +495,11 @@ class Main(Star):
         }
         return mapping.get(provider.lower(), provider)
 
-    def _parse_antigravity_quota(self, models: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """解析 Antigravity 配额信息，返回按分组聚合的配额列表"""
+    def _parse_quota(self, models: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """解析配额信息，返回按分组聚合的配额列表 (通用方法，支持所有 Google Cloud Code 凭证)"""
         groups = []
 
-        for group_def in ANTIGRAVITY_QUOTA_GROUPS:
+        for group_def in QUOTA_GROUPS:
             group_id = group_def["id"]
             label = group_def["label"]
             identifiers = group_def["identifiers"]
@@ -314,6 +511,70 @@ class Main(Star):
                     quota_info = entry.get("quotaInfo", entry.get("quota_info", {}))
                     remaining = quota_info.get("remainingFraction", quota_info.get("remaining_fraction"))
                     reset_time = quota_info.get("resetTime", quota_info.get("reset_time"))
+
+                    if remaining is not None:
+                        matched_entries.append({
+                            "model": identifier,
+                            "remaining": remaining,
+                            "reset_time": reset_time
+                        })
+
+            if matched_entries:
+                # 取最小的 remaining 作为组的配额
+                min_remaining = min(e["remaining"] for e in matched_entries)
+                # 取最早的 reset_time
+                reset_times = [e["reset_time"] for e in matched_entries if e["reset_time"]]
+                earliest_reset = None
+                if reset_times:
+                    try:
+                        earliest_reset = min(reset_times)
+                    except Exception:
+                        earliest_reset = reset_times[0] if reset_times else None
+
+                groups.append({
+                    "id": group_id,
+                    "label": label,
+                    "remaining_percent": round(min_remaining * 100),
+                    "reset_time": earliest_reset,
+                    "models": [e["model"] for e in matched_entries]
+                })
+
+        return groups
+
+    def _parse_antigravity_quota(self, models: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """解析 Antigravity 配额信息 (保留向后兼容)"""
+        return self._parse_quota(models)
+
+    def _parse_gemini_cli_quota(self, buckets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """解析 GeminiCLI 配额信息 (buckets 格式)
+
+        Args:
+            buckets: API 返回的 buckets 数组，格式如：
+                [{"modelId": "gemini-2.5-flash", "remainingFraction": 1, "resetTime": "...", "tokenType": "REQUESTS"}]
+
+        Returns:
+            配额分组列表，格式与 _parse_quota 一致
+        """
+        groups = []
+
+        # 将 buckets 转换为按 modelId 索引的字典
+        model_map = {}
+        for bucket in buckets:
+            model_id = bucket.get("modelId", "")
+            if model_id:
+                model_map[model_id] = bucket
+
+        for group_def in GEMINI_CLI_QUOTA_GROUPS:
+            group_id = group_def["id"]
+            label = group_def["label"]
+            identifiers = group_def["identifiers"]
+
+            matched_entries = []
+            for identifier in identifiers:
+                if identifier in model_map:
+                    bucket = model_map[identifier]
+                    remaining = bucket.get("remainingFraction")
+                    reset_time = bucket.get("resetTime")
 
                     if remaining is not None:
                         matched_entries.append({
@@ -573,7 +834,7 @@ class Main(Star):
         }
 
     async def _build_quota_data(self, client: CPAClient) -> Optional[Dict[str, Any]]:
-        """构建配额页面的模板数据"""
+        """构建配额页面的模板数据（支持多凭证类型）"""
         auth_data = await client.get_auth_files()
 
         if not auth_data:
@@ -583,104 +844,148 @@ class Main(Star):
         if not auth_files:
             return None
 
-        # 筛选 Antigravity 账号
-        antigravity_auths = [
+        # 筛选支持配额查询的账号 (Antigravity 和 GeminiCLI)
+        quota_auths = [
             auth for auth in auth_files
-            if auth.get("provider", auth.get("type", "")).lower() == "antigravity"
+            if auth.get("provider", auth.get("type", "")).lower() in QUOTA_SUPPORTED_PROVIDERS
         ]
 
-        if not antigravity_auths:
+        if not quota_auths:
             return None
 
+        # 按凭证类型分组 (将 gemini-cli 归类为 gemini)
+        provider_groups: Dict[str, List[Dict[str, Any]]] = {}
+        for auth in quota_auths:
+            provider = auth.get("provider", auth.get("type", "unknown")).lower()
+            # 标准化 provider 名称：gemini-cli -> gemini
+            display_provider = "gemini" if provider == "gemini-cli" else provider
+            if display_provider not in provider_groups:
+                provider_groups[display_provider] = []
+            provider_groups[display_provider].append(auth)
+
         accounts = []
-        for auth in antigravity_auths:
-            auth_index = auth.get("auth_index", "")
-            email = auth.get("email", "")
-            name = auth.get("name", auth.get("id", "未知"))
-            disabled = auth.get("disabled", False)
-            unavailable = auth.get("unavailable", False)
+        for provider, auths in provider_groups.items():
+            provider_info = PROVIDER_INFO.get(provider, {"name": provider.title(), "icon": "📦", "color": "#6b7280"})
 
-            icon = "❌" if (disabled or unavailable) else "✅"
-            display = email if email else name
-            if len(display) > 30:
-                display = display[:27] + "..."
+            for auth in auths:
+                auth_index = auth.get("auth_index", "")
+                email = auth.get("email", "")
+                name = auth.get("name", auth.get("id", "未知"))
+                disabled = auth.get("disabled", False)
+                unavailable = auth.get("unavailable", False)
+                # 获取原始的 provider 类型（用于 API 调用）
+                original_provider = auth.get("provider", auth.get("type", "unknown")).lower()
 
-            account_data = {
-                "icon": icon,
-                "email": display,
-                "error": None,
-                "quotas": []
-            }
+                icon = "❌" if (disabled or unavailable) else "✅"
+                display = email if email else name
+                if len(display) > 30:
+                    display = display[:27] + "..."
 
-            if not auth_index:
-                account_data["error"] = "无法获取配额（缺少 auth_index）"
-                accounts.append(account_data)
-                continue
+                account_data = {
+                    "icon": icon,
+                    "email": display,
+                    "provider": provider,
+                    "provider_name": provider_info["name"],
+                    "provider_icon": provider_info["icon"],
+                    "provider_color": provider_info["color"],
+                    "error": None,
+                    "quotas": []
+                }
 
-            if disabled or unavailable:
-                account_data["error"] = "账号已禁用或不可用"
-                accounts.append(account_data)
-                continue
+                if not auth_index:
+                    account_data["error"] = "无法获取配额（缺少 auth_index）"
+                    accounts.append(account_data)
+                    continue
 
-            # 获取配额信息
-            quota_data = await client.get_antigravity_quota(auth_index)
+                if disabled or unavailable:
+                    account_data["error"] = "账号已禁用或不可用"
+                    accounts.append(account_data)
+                    continue
 
-            if not quota_data:
-                account_data["error"] = "获取配额失败"
-                accounts.append(account_data)
-                continue
+                # 获取配额信息（使用通用方法，传递原始 provider 类型和文件名）
+                quota_result = await client.get_google_quota(auth_index, original_provider, name)
 
-            models = quota_data.get("models", {})
-            if not models:
-                account_data["error"] = "无可用模型"
-                accounts.append(account_data)
-                continue
+                if not quota_result.get("success"):
+                    # 根据错误码显示不同的错误信息
+                    error_code = quota_result.get("error_code", 0)
+                    if error_code == 403:
+                        account_data["error"] = "不支持配额查询"
+                        account_data["error_detail"] = "此凭证类型暂不支持配额查询"
+                    else:
+                        account_data["error"] = quota_result.get("error", "获取配额失败")
+                    accounts.append(account_data)
+                    continue
 
-            quota_groups = self._parse_antigravity_quota(models)
-            if not quota_groups:
-                account_data["error"] = "无配额信息"
-                accounts.append(account_data)
-                continue
-
-            for group in quota_groups:
-                percent = group["remaining_percent"]
-                reset_time = self._format_reset_time(group.get("reset_time"))
-                label = group["label"]
-
-                # 配额状态
-                if percent >= 80:
-                    status_icon = "🟢"
-                    color = "#10b981"
-                    level = "high"
-                elif percent >= 50:
-                    status_icon = "🟡"
-                    color = "#f59e0b"
-                    level = "medium"
-                elif percent >= 20:
-                    status_icon = "🟠"
-                    color = "#f97316"
-                    level = "medium"
+                # 根据凭证类型选择解析方法
+                if original_provider in ("gemini", "gemini-cli"):
+                    # GeminiCLI 使用 buckets 格式
+                    buckets = quota_result.get("buckets", [])
+                    if not buckets:
+                        account_data["error"] = "无配额信息"
+                        accounts.append(account_data)
+                        continue
+                    quota_groups = self._parse_gemini_cli_quota(buckets)
                 else:
-                    status_icon = "🔴"
-                    color = "#ef4444"
-                    level = "low"
+                    # Antigravity 使用 models 格式
+                    models = quota_result.get("models", {})
+                    if not models:
+                        account_data["error"] = "无可用模型"
+                        accounts.append(account_data)
+                        continue
+                    quota_groups = self._parse_quota(models)
 
-                account_data["quotas"].append({
-                    "label": label,
-                    "icon": status_icon,
-                    "percent": percent,
-                    "color": color,
-                    "level": level,
-                    "reset_time": reset_time
-                })
+                if not quota_groups:
+                    account_data["error"] = "无配额信息"
+                    accounts.append(account_data)
+                    continue
 
-            accounts.append(account_data)
+                for group in quota_groups:
+                    percent = group["remaining_percent"]
+                    reset_time = self._format_reset_time(group.get("reset_time"))
+                    label = group["label"]
+
+                    # 配额状态
+                    if percent >= 80:
+                        status_icon = "🟢"
+                        color = "#10b981"
+                        level = "high"
+                    elif percent >= 50:
+                        status_icon = "🟡"
+                        color = "#f59e0b"
+                        level = "medium"
+                    elif percent >= 20:
+                        status_icon = "🟠"
+                        color = "#f97316"
+                        level = "medium"
+                    else:
+                        status_icon = "🔴"
+                        color = "#ef4444"
+                        level = "low"
+
+                    account_data["quotas"].append({
+                        "label": label,
+                        "icon": status_icon,
+                        "percent": percent,
+                        "color": color,
+                        "level": level,
+                        "reset_time": reset_time
+                    })
+
+                accounts.append(account_data)
+
+        # 构建支持的凭证类型摘要
+        provider_summary = []
+        for provider in provider_groups.keys():
+            info = PROVIDER_INFO.get(provider, {"name": provider.title(), "icon": "📦"})
+            count = len([a for a in accounts if a.get("provider") == provider])
+            provider_summary.append(f"{info['icon']} {info['name']} ({count})")
 
         return {
             "stats_type": "quota",
             "title": "📊 OAuth 配额状态",
-            "subtitle": "Antigravity 账号",
-            "accounts": accounts
+            "subtitle": " | ".join(provider_summary) if provider_summary else "无账号",
+            "accounts": accounts,
+            "provider_groups": list(provider_groups.keys())
         }
 
     async def _get_overview(self, client: CPAClient) -> str:
@@ -698,7 +1003,7 @@ class Main(Star):
         return self._build_text_from_data(data) or "❌ 数据格式化失败"
 
     async def _get_quota_status(self, client: CPAClient) -> str:
-        """获取 OAuth 账号配额状态（实时从 API 获取）"""
+        """获取 OAuth 账号配额状态（实时从 API 获取，支持多凭证类型）"""
         auth_data = await client.get_auth_files()
 
         if not auth_data:
@@ -709,86 +1014,117 @@ class Main(Star):
         if not auth_files:
             return "📭 暂无 OAuth 账号"
 
-        # 筛选 Antigravity 账号
-        antigravity_auths = [
+        # 筛选支持配额查询的账号
+        quota_auths = [
             auth for auth in auth_files
-            if auth.get("provider", auth.get("type", "")).lower() == "antigravity"
+            if auth.get("provider", auth.get("type", "")).lower() in QUOTA_SUPPORTED_PROVIDERS
         ]
 
-        if not antigravity_auths:
-            return "📭 暂无 Antigravity 账号（当前仅支持 Antigravity 配额查询）"
+        if not quota_auths:
+            supported_names = ", ".join([PROVIDER_INFO.get(p, {}).get("name", p) for p in QUOTA_SUPPORTED_PROVIDERS])
+            return f"📭 暂无支持配额查询的账号（支持: {supported_names}）"
 
         lines = ["📊 OAuth 账号配额状态", ""]
 
-        for auth in antigravity_auths:
-            auth_index = auth.get("auth_index", "")
-            email = auth.get("email", "")
-            name = auth.get("name", auth.get("id", "未知"))
-            disabled = auth.get("disabled", False)
-            unavailable = auth.get("unavailable", False)
+        # 按凭证类型分组 (将 gemini-cli 归类为 gemini)
+        provider_groups: Dict[str, list] = {}
+        for auth in quota_auths:
+            provider = auth.get("provider", auth.get("type", "unknown")).lower()
+            # 标准化 provider 名称：gemini-cli -> gemini
+            display_provider = "gemini" if provider == "gemini-cli" else provider
+            if display_provider not in provider_groups:
+                provider_groups[display_provider] = []
+            provider_groups[display_provider].append(auth)
 
-            # 状态图标
-            if disabled or unavailable:
-                icon = "❌"
-            else:
-                icon = "✅"
-
-            display = email if email else name
-            if len(display) > 30:
-                display = display[:27] + "..."
-
-            lines.append(f"{icon} {display}")
-
-            if not auth_index:
-                lines.append("   ⚠️ 无法获取配额（缺少 auth_index）")
-                lines.append("")
-                continue
-
-            if disabled or unavailable:
-                lines.append("   ⚠️ 账号已禁用或不可用")
-                lines.append("")
-                continue
-
-            # 获取配额信息
-            quota_data = await client.get_antigravity_quota(auth_index)
-
-            if not quota_data:
-                lines.append("   ⚠️ 获取配额失败")
-                lines.append("")
-                continue
-
-            models = quota_data.get("models", {})
-            if not models:
-                lines.append("   ⚠️ 无可用模型")
-                lines.append("")
-                continue
-
-            # 解析配额分组
-            quota_groups = self._parse_antigravity_quota(models)
-
-            if not quota_groups:
-                lines.append("   ⚠️ 无配额信息")
-                lines.append("")
-                continue
-
-            for group in quota_groups:
-                percent = group["remaining_percent"]
-                reset_time = self._format_reset_time(group.get("reset_time"))
-                label = group["label"]
-
-                # 配额百分比颜色提示
-                if percent >= 80:
-                    status_icon = "🟢"
-                elif percent >= 50:
-                    status_icon = "🟡"
-                elif percent >= 20:
-                    status_icon = "🟠"
-                else:
-                    status_icon = "🔴"
-
-                lines.append(f"   {status_icon} {label}: {percent}% | 刷新: {reset_time}")
-
+        for provider, auths in provider_groups.items():
+            provider_info = PROVIDER_INFO.get(provider, {"name": provider.title(), "icon": "📦"})
+            lines.append(f"━━━ {provider_info['icon']} {provider_info['name']} ━━━")
             lines.append("")
+
+            for auth in auths:
+                auth_index = auth.get("auth_index", "")
+                email = auth.get("email", "")
+                name = auth.get("name", auth.get("id", "未知"))
+                disabled = auth.get("disabled", False)
+                unavailable = auth.get("unavailable", False)
+                # 获取原始的 provider 类型（用于 API 调用）
+                original_provider = auth.get("provider", auth.get("type", "unknown")).lower()
+
+                # 状态图标
+                if disabled or unavailable:
+                    icon = "❌"
+                else:
+                    icon = "✅"
+
+                display = email if email else name
+                if len(display) > 30:
+                    display = display[:27] + "..."
+
+                lines.append(f"{icon} {display}")
+
+                if not auth_index:
+                    lines.append("   ⚠️ 无法获取配额（缺少 auth_index）")
+                    lines.append("")
+                    continue
+
+                if disabled or unavailable:
+                    lines.append("   ⚠️ 账号已禁用或不可用")
+                    lines.append("")
+                    continue
+
+                # 获取配额信息（使用原始 provider 类型和文件名）
+                quota_result = await client.get_google_quota(auth_index, original_provider, name)
+
+                if not quota_result.get("success"):
+                    error_code = quota_result.get("error_code", 0)
+                    if error_code == 403:
+                        lines.append("   ⚠️ 不支持配额查询")
+                    else:
+                        lines.append(f"   ⚠️ {quota_result.get('error', '获取配额失败')}")
+                    lines.append("")
+                    continue
+
+                # 根据凭证类型选择解析方法
+                if original_provider in ("gemini", "gemini-cli"):
+                    # GeminiCLI 使用 buckets 格式
+                    buckets = quota_result.get("buckets", [])
+                    if not buckets:
+                        lines.append("   ⚠️ 无配额信息")
+                        lines.append("")
+                        continue
+                    quota_groups = self._parse_gemini_cli_quota(buckets)
+                else:
+                    # Antigravity 使用 models 格式
+                    models = quota_result.get("models", {})
+                    if not models:
+                        lines.append("   ⚠️ 无可用模型")
+                        lines.append("")
+                        continue
+                    quota_groups = self._parse_quota(models)
+
+                if not quota_groups:
+                    lines.append("   ⚠️ 无配额信息")
+                    lines.append("")
+                    continue
+
+                for group in quota_groups:
+                    percent = group["remaining_percent"]
+                    reset_time = self._format_reset_time(group.get("reset_time"))
+                    label = group["label"]
+
+                    # 配额百分比颜色提示
+                    if percent >= 80:
+                        status_icon = "🟢"
+                    elif percent >= 50:
+                        status_icon = "🟡"
+                    elif percent >= 20:
+                        status_icon = "🟠"
+                    else:
+                        status_icon = "🔴"
+
+                    lines.append(f"   {status_icon} {label}: {percent}% | 刷新: {reset_time}")
+
+                lines.append("")
 
         lines.append("💡 配额每日自动刷新，百分比为剩余额度")
 

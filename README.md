@@ -7,7 +7,9 @@
 - 查看 API 使用统计（请求数、Token 用量、成功率等）
 - 查看今日详细使用情况（按模型统计）
 - **实时查询 OAuth 账号配额**（剩余百分比、刷新时间）
-- 支持 Antigravity 配额查询（Claude、Gemini 等模型）
+- 支持多种凭证类型的配额查询：
+  - 🚀 **Antigravity** - 反重力账号
+  - 💎 **GeminiCLI** - Gemini CLI 账号
 
 ## 安装
 
@@ -78,19 +80,26 @@ git clone https://github.com/muyouzhi6/astrbot_plugin_cliproxy_stats.git
 
 ### /cpa额度 - 查看配额状态
 
-**实时**查询各 OAuth 账号的模型配额信息。
+**实时**查询各 OAuth 账号的模型配额信息，支持 Antigravity 和 GeminiCLI 账号。
 
 ```
-📊 OAuth 账号配额状态
+📊 OAuth 配额状态
+🚀 Antigravity (2) | 💎 GeminiCLI (1)
+
+━━━ 🚀 Antigravity ━━━
 
 ✅ example@gmail.com
    🟢 Claude/GPT: 86% | 刷新: 01/05 00:36
    🟢 Gemini 3 Pro: 99% | 刷新: 01/05 00:12
    🟢 Gemini 2.5 Flash: 100% | 刷新: 01/05 00:41
-   🟢 Gemini 2.5 Flash Lite: 100% | 刷新: 01/05 00:41
-   🟢 Gemini 2.5 CU: 100% | 刷新: 01/05 00:41
    🟢 Gemini 3 Flash: 99% | 刷新: 01/05 00:09
-   🟢 Gemini 3 Pro Image: 95% | 刷新: 01/05 00:12
+
+━━━ 💎 GeminiCLI ━━━
+
+✅ another@gmail.com
+   🟢 Claude/GPT: 92% | 刷新: 01/05 00:20
+   🟢 Gemini 3 Pro: 100% | 刷新: 01/05 00:15
+   🟡 Gemini 2.5 Flash: 65% | 刷新: 01/05 00:30
 
 💡 配额每日自动刷新，百分比为剩余额度
 ```
@@ -104,9 +113,18 @@ git clone https://github.com/muyouzhi6/astrbot_plugin_cliproxy_stats.git
 | 🟠 | 偏低 (20-50%) |
 | 🔴 | 紧张 (<20%) |
 
+## 支持的凭证类型
+
+当前支持以下凭证类型的配额查询：
+
+| 类型 | 图标 | 说明 |
+|------|------|------|
+| Antigravity | 🚀 | 反重力账号（Google Cloud Code） |
+| GeminiCLI | 💎 | Gemini CLI 账号（Google Cloud Code） |
+
 ## 支持的模型分组
 
-当前支持以下 Antigravity 模型分组的配额查询：
+以下模型分组可用于 Antigravity 和 GeminiCLI 账号：
 
 - **Claude/GPT**: claude-sonnet-4-5-thinking, claude-opus-4-5-thinking, claude-sonnet-4-5, gpt-oss-120b-medium
 - **Gemini 3 Pro**: gemini-3-pro-high, gemini-3-pro-low

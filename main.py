@@ -903,7 +903,9 @@ class Main(Star):
                     continue
 
                 # 获取配额信息（使用通用方法，传递原始 provider 类型和文件名）
+                logger.debug(f"正在获取配额: provider={original_provider}, name={name}, auth_index={auth_index}")
                 quota_result = await client.get_google_quota(auth_index, original_provider, name)
+                logger.debug(f"配额获取结果: success={quota_result.get('success')}, buckets={len(quota_result.get('buckets', []))}, models={len(quota_result.get('models', {}))}")
 
                 if not quota_result.get("success"):
                     # 根据错误码显示不同的错误信息
@@ -985,7 +987,8 @@ class Main(Star):
             "title": "📊 OAuth 配额状态",
             "subtitle": " | ".join(provider_summary) if provider_summary else "无账号",
             "accounts": accounts,
-            "provider_groups": list(provider_groups.keys())
+            "provider_groups": list(provider_groups.keys()),
+            "query_time": datetime.now().strftime("%H:%M:%S")  # 添加查询时间用于调试
         }
 
     async def _get_overview(self, client: CPAClient) -> str:

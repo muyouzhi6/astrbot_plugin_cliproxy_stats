@@ -552,8 +552,11 @@ class StatsCardRenderer:
         draw.text((padding, y), data.get("title", "OAuth 配额状态"),
                   fill=self.COLORS["text_primary"], font=font_title)
 
-        # 副标题（凭证统计摘要）
+        # 副标题（凭证统计摘要 + 查询时间）
         subtitle = data.get("subtitle", "")
+        query_time = data.get("query_time", "")
+        if query_time:
+            subtitle = f"{subtitle}  ⏱️ {query_time}" if subtitle else f"⏱️ {query_time}"
         if subtitle:
             draw.text((padding, y + 34 * scale), subtitle,
                       fill=self.COLORS["text_secondary"], font=font_small)

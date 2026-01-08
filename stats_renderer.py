@@ -196,7 +196,7 @@ class StatsCardRenderer:
             base_height += 40 + len(apis[:8]) * 36
         if auth_info:
             base_height += 60 + len(auth_info.get("providers", [])) * 28
-        base_height += 40
+        base_height += 50  # 包含查询时间显示空间
 
         # 实际渲染尺寸（2x）
         width = base_width * scale
@@ -336,6 +336,15 @@ class StatsCardRenderer:
                           fill=self.COLORS["text_primary"], font=font_small)
                 y += 26 * scale
 
+        # 显示查询时间
+        query_time = data.get("query_time", "")
+        if query_time:
+            y += 8 * scale
+            time_text = f"🔄 查询时间: {query_time}"
+            time_width = self._get_text_size(draw, time_text, font_small)[0]
+            draw.text((width - padding - time_width, y),
+                      time_text, fill=self.COLORS["accent_cyan"], font=font_small)
+
         # 缩小到目标尺寸
         return self._downscale_image(img)
 
@@ -352,7 +361,7 @@ class StatsCardRenderer:
             base_height += 40 + len(model_stats[:10]) * 34
         if time_slots:
             base_height += 100  # 增加时段分布的高度
-        base_height += 40
+        base_height += 60  # 包含查询时间显示空间
 
         width = base_width * scale
         height = base_height * scale
@@ -501,6 +510,16 @@ class StatsCardRenderer:
                 draw.text((x + slot_width - count_width - 4 * scale, y + bar_height + 6 * scale),
                           count_text, fill=slot_colors[i], font=font_tiny)
 
+            y += bar_height + 28 * scale
+
+        # 显示查询时间
+        query_time = data.get("query_time", "")
+        if query_time:
+            time_text = f"🔄 查询时间: {query_time}"
+            time_width = self._get_text_size(draw, time_text, font_small)[0]
+            draw.text((width - padding - time_width, y),
+                      time_text, fill=self.COLORS["accent_cyan"], font=font_small)
+
         return self._downscale_image(img)
 
     def render_quota(self, data: Dict[str, Any]) -> Image.Image:
@@ -645,10 +664,18 @@ class StatsCardRenderer:
 
             y += 8 * scale  # 凭证类型分组间距
 
-        # 底部提示
+        # 底部提示和查询时间
         tip_text = "💡 配额每日自动刷新，百分比为剩余额度"
         draw.text((padding, y), tip_text,
                   fill=self.COLORS["text_muted"], font=font_small)
+
+        # 右下角显示查询时间（更醒目）
+        query_time = data.get("query_time", "")
+        if query_time:
+            time_text = f"🔄 查询时间: {query_time}"
+            time_width = self._get_text_size(draw, time_text, font_small)[0]
+            draw.text((width - padding - time_width, y),
+                      time_text, fill=self.COLORS["accent_cyan"], font=font_small)
 
         return self._downscale_image(img)
 

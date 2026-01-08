@@ -760,7 +760,8 @@ class Main(Star):
             "success_rate": success_rate,
             "total_tokens": self._format_tokens(total_tokens),
             "apis": api_list,
-            "auth_info": auth_info
+            "auth_info": auth_info,
+            "query_time": datetime.now().strftime("%H:%M:%S")
         }
 
     async def _build_today_data(self, client: CPAClient) -> Optional[Dict[str, Any]]:
@@ -830,7 +831,8 @@ class Main(Star):
             "today_requests": today_requests,
             "today_tokens": self._format_tokens(today_tokens),
             "model_stats": model_stats if model_stats else None,
-            "time_slots": time_slots if sum(s["count"] for s in time_slots) > 0 else None
+            "time_slots": time_slots if sum(s["count"] for s in time_slots) > 0 else None,
+            "query_time": datetime.now().strftime("%H:%M:%S")
         }
 
     async def _build_quota_data(self, client: CPAClient) -> Optional[Dict[str, Any]]:

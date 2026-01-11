@@ -1,6 +1,5 @@
 name: astrbot_plugin_cliproxy_stats
 desc: CLIProxyAPI 额度与使用统计查询插件，通过指令查看 OAuth 模型额度和当日调用统计
 author: 木有知
-version: 1.0.2
+version: 1.0.0
 repo: "https://github.com/muyouzhi6/astrbot_plugin_cliproxy_stats"
-

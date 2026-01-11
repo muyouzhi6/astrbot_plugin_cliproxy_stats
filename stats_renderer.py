@@ -1,6 +1,7 @@
 """
 美观的统计卡片渲染器
 使用 Pillow 绘制现代卡片风格的统计图片
+支持高分辨率渲染和 Token 分解显示
 """
 
 import os
@@ -48,7 +49,7 @@ def _find_font_path() -> Optional[str]:
     return None
 
 
-@lru_cache(maxsize=32)
+@lru_cache(maxsize=64)
 def get_font(size: int) -> ImageFont.FreeTypeFont:
     """获取字体，优先使用系统中文字体（带缓存）"""
     font_path = _find_font_path()
@@ -67,47 +68,52 @@ def get_font(size: int) -> ImageFont.FreeTypeFont:
 
 
 class StatsCardRenderer:
-    """统计卡片渲染器"""
+    """统计卡片渲染器 - 增强版"""
 
-    # 颜色主题
+    # 现代配色主题
     COLORS = {
-        "bg_gradient_start": (30, 41, 59),      # 深蓝灰背景
-        "bg_gradient_end": (15, 23, 42),        # 更深的蓝灰
-        "card_bg": (51, 65, 85),                # 卡片背景
-        "card_border": (71, 85, 105),           # 卡片边框
-        "text_primary": (248, 250, 252),        # 主文字 - 亮白
-        "text_secondary": (148, 163, 184),      # 次要文字 - 灰白
-        "text_muted": (100, 116, 139),          # 更淡的文字
-        "accent_blue": (59, 130, 246),          # 强调色 - 蓝
-        "accent_green": (34, 197, 94),          # 成功 - 绿
-        "accent_yellow": (234, 179, 8),         # 警告 - 黄
-        "accent_orange": (249, 115, 22),        # 橙色
-        "accent_red": (239, 68, 68),            # 错误 - 红
-        "accent_purple": (168, 85, 247),        # 紫色 - Antigravity
-        "accent_cyan": (34, 211, 238),          # 青色
-        "accent_indigo": (99, 102, 241),        # 靛蓝色 - GeminiCLI
-        "progress_bg": (30, 41, 59),            # 进度条背景
-        "divider": (71, 85, 105),               # 分割线
+        "bg_gradient_start": (24, 32, 48),       # 深蓝灰背景
+        "bg_gradient_end": (12, 18, 32),         # 更深的蓝灰
+        "card_bg": (38, 50, 72),                 # 卡片背景
+        "card_bg_light": (48, 62, 88),           # 浅卡片背景
+        "card_border": (58, 75, 100),            # 卡片边框
+        "text_primary": (248, 250, 252),         # 主文字 - 亮白
+        "text_secondary": (156, 172, 196),       # 次要文字 - 灰白
+        "text_muted": (108, 126, 152),           # 更淡的文字
+        "accent_blue": (66, 138, 255),           # 强调色 - 蓝
+        "accent_green": (52, 211, 120),          # 成功 - 绿
+        "accent_yellow": (250, 190, 40),         # 警告 - 黄
+        "accent_orange": (255, 128, 48),         # 橙色
+        "accent_red": (248, 80, 80),             # 错误 - 红
+        "accent_purple": (178, 102, 255),        # 紫色 - Antigravity
+        "accent_cyan": (56, 220, 248),           # 青色
+        "accent_indigo": (108, 112, 255),        # 靛蓝色 - GeminiCLI
+        "accent_pink": (248, 96, 168),           # 粉色
+        "progress_bg": (28, 36, 52),             # 进度条背景
+        "divider": (58, 75, 100),                # 分割线
     }
 
     # 凭证类型颜色映射
     PROVIDER_COLORS = {
-        "antigravity": (168, 85, 247),   # 紫色
-        "gemini": (99, 102, 241),        # 靛蓝色
-        "gemini-cli": (99, 102, 241),    # 靛蓝色 (CPA 内部使用的名称)
-        "claude": (249, 115, 22),        # 橙色
-        "codex": (16, 185, 129),         # 翠绿色
-        "iflow": (6, 182, 212),          # 青色
-        "qwen": (236, 72, 153),          # 粉色
+        "antigravity": (178, 102, 255),   # 紫色
+        "gemini": (108, 112, 255),        # 靛蓝色
+        "gemini-cli": (108, 112, 255),    # 靛蓝色
+        "claude": (255, 128, 48),         # 橙色
+        "codex": (52, 200, 140),          # 翠绿色
+        "iflow": (56, 200, 224),          # 青色
+        "qwen": (248, 96, 168),           # 粉色
     }
 
-    # 高清渲染缩放倍数（2x 渲染后缩小，提高清晰度）
-    SCALE_FACTOR = 2
-
-    def __init__(self):
-        self.padding = 24
+    def __init__(self, high_res: bool = True):
+        """初始化渲染器
+        
+        Args:
+            high_res: 是否启用高分辨率渲染（3x），否则使用 2x
+        """
+        self.SCALE_FACTOR = 3 if high_res else 2
+        self.padding = 28
         self.card_radius = 16
-        self.card_padding = 20
+        self.card_padding = 24
 
     def _scale(self, value: int) -> int:
         """根据缩放因子调整数值"""
@@ -118,6 +124,28 @@ class StatsCardRenderer:
         target_width = img.width // self.SCALE_FACTOR
         target_height = img.height // self.SCALE_FACTOR
         return img.resize((target_width, target_height), Image.Resampling.LANCZOS)
+
+    def _crop_to_content(self, img: Image.Image, final_y: int, padding: int = 0) -> Image.Image:
+        """裁剪图片到实际内容高度，移除底部空白
+        
+        Args:
+            img: 原始图片
+            final_y: 内容实际结束的 y 坐标（已缩放）
+            padding: 底部额外留白（已缩放）
+        
+        Returns:
+            裁剪后的图片
+        """
+        # 计算裁剪高度（内容高度 + 底部留白）
+        crop_height = final_y + padding
+        # 确保不超过原图高度
+        crop_height = min(crop_height, img.height)
+        # 确保最小高度
+        crop_height = max(crop_height, 100 * self.SCALE_FACTOR)
+        
+        if crop_height < img.height:
+            return img.crop((0, 0, img.width, crop_height))
+        return img
 
     def _create_gradient_bg(self, width: int, height: int) -> Image.Image:
         """创建渐变背景"""
@@ -138,9 +166,17 @@ class StatsCardRenderer:
 
     def _draw_rounded_rect(self, draw: ImageDraw.Draw, xy: Tuple[int, int, int, int],
                            radius: int, fill: Tuple[int, int, int],
-                           outline: Optional[Tuple[int, int, int]] = None):
+                           outline: Optional[Tuple[int, int, int]] = None,
+                           outline_width: int = 1):
         """绘制圆角矩形"""
         x1, y1, x2, y2 = xy
+        
+        # 确保半径不超过矩形的一半
+        max_radius = min((x2 - x1) // 2, (y2 - y1) // 2)
+        radius = min(radius, max_radius)
+        if radius < 1:
+            draw.rectangle([x1, y1, x2, y2], fill=fill, outline=outline)
+            return
 
         # 绘制填充
         draw.rectangle([x1 + radius, y1, x2 - radius, y2], fill=fill)
@@ -152,14 +188,14 @@ class StatsCardRenderer:
 
         # 绘制边框
         if outline:
-            draw.arc([x1, y1, x1 + radius * 2, y1 + radius * 2], 180, 270, fill=outline)
-            draw.arc([x2 - radius * 2, y1, x2, y1 + radius * 2], 270, 360, fill=outline)
-            draw.arc([x1, y2 - radius * 2, x1 + radius * 2, y2], 90, 180, fill=outline)
-            draw.arc([x2 - radius * 2, y2 - radius * 2, x2, y2], 0, 90, fill=outline)
-            draw.line([x1 + radius, y1, x2 - radius, y1], fill=outline)
-            draw.line([x1 + radius, y2, x2 - radius, y2], fill=outline)
-            draw.line([x1, y1 + radius, x1, y2 - radius], fill=outline)
-            draw.line([x2, y1 + radius, x2, y2 - radius], fill=outline)
+            draw.arc([x1, y1, x1 + radius * 2, y1 + radius * 2], 180, 270, fill=outline, width=outline_width)
+            draw.arc([x2 - radius * 2, y1, x2, y1 + radius * 2], 270, 360, fill=outline, width=outline_width)
+            draw.arc([x1, y2 - radius * 2, x1 + radius * 2, y2], 90, 180, fill=outline, width=outline_width)
+            draw.arc([x2 - radius * 2, y2 - radius * 2, x2, y2], 0, 90, fill=outline, width=outline_width)
+            draw.line([x1 + radius, y1, x2 - radius, y1], fill=outline, width=outline_width)
+            draw.line([x1 + radius, y2, x2 - radius, y2], fill=outline, width=outline_width)
+            draw.line([x1, y1 + radius, x1, y2 - radius], fill=outline, width=outline_width)
+            draw.line([x2, y1 + radius, x2, y2 - radius], fill=outline, width=outline_width)
 
     def _draw_progress_bar(self, draw: ImageDraw.Draw, x: int, y: int,
                            width: int, height: int, percent: int,
@@ -344,24 +380,35 @@ class StatsCardRenderer:
             time_width = self._get_text_size(draw, time_text, font_small)[0]
             draw.text((width - padding - time_width, y),
                       time_text, fill=self.COLORS["accent_cyan"], font=font_small)
+            y += 20 * scale
 
+        # 裁剪到实际内容高度
+        img = self._crop_to_content(img, y, padding=16 * scale)
+        
         # 缩小到目标尺寸
         return self._downscale_image(img)
 
     def render_today(self, data: Dict[str, Any]) -> Image.Image:
-        """渲染今日统计卡片"""
-        base_width = 520
+        """渲染今日统计卡片（增强版：支持 Token 分解和凭证统计）"""
+        base_width = 680  # 加宽以容纳更多信息
         scale = self.SCALE_FACTOR
 
         model_stats = data.get("model_stats") or []
         time_slots = data.get("time_slots") or []
+        auth_stats = data.get("auth_stats") or []
+        token_breakdown = data.get("token_breakdown") or {}
 
-        base_height = 200
+        # 计算高度
+        base_height = 240  # 基础区域（标题 + 统计卡片）
+        if token_breakdown:
+            base_height += 80  # Token 分解区域
         if model_stats:
-            base_height += 40 + len(model_stats[:10]) * 34
+            base_height += 50 + min(len(model_stats), 15) * 36
+        if auth_stats:
+            base_height += 50 + min(len(auth_stats), 8) * 32
         if time_slots:
-            base_height += 100  # 增加时段分布的高度
-        base_height += 60  # 包含查询时间显示空间
+            base_height += 120
+        base_height += 60  # 底部空间
 
         width = base_width * scale
         height = base_height * scale
@@ -370,63 +417,112 @@ class StatsCardRenderer:
         img = self._create_gradient_bg(width, height)
         draw = ImageDraw.Draw(img)
 
-        font_title = get_font(24 * scale)
-        font_large = get_font(32 * scale)
-        font_medium = get_font(16 * scale)
-        font_small = get_font(14 * scale)
-        font_tiny = get_font(12 * scale)
+        font_title = get_font(26 * scale)
+        font_large = get_font(36 * scale)
+        font_medium = get_font(18 * scale)
+        font_small = get_font(15 * scale)
+        font_tiny = get_font(13 * scale)
 
         y = padding
 
         # 标题
         draw.text((padding, y), data.get("title", "今日统计"),
                   fill=self.COLORS["text_primary"], font=font_title)
-        draw.text((padding, y + 32 * scale), data.get("subtitle", ""),
+        
+        # 成功率标签（右上角）
+        success_rate = data.get("success_rate", 100)
+        rate_color = self.COLORS["accent_green"] if success_rate >= 95 else \
+                     self.COLORS["accent_yellow"] if success_rate >= 80 else \
+                     self.COLORS["accent_red"]
+        rate_text = f"成功率 {success_rate}%"
+        rate_width = self._get_text_size(draw, rate_text, font_small)[0]
+        draw.text((width - padding - rate_width, y + 8 * scale), rate_text,
+                  fill=rate_color, font=font_small)
+        
+        draw.text((padding, y + 36 * scale), data.get("subtitle", ""),
                   fill=self.COLORS["text_secondary"], font=font_small)
-        y += 60 * scale
+        y += 70 * scale
 
-        # 今日统计卡片
-        card_width = (width - padding * 3) // 2
+        # 主统计卡片（3列：请求数、Token、成功率）
+        card_width = (width - padding * 4) // 3
+        card_height = 90 * scale
 
         # 请求数
         self._draw_rounded_rect(draw,
-            (padding, y, padding + card_width, y + 80 * scale),
-            12 * scale, self.COLORS["card_bg"], self.COLORS["card_border"])
-        draw.text((padding + 16 * scale, y + 12 * scale), "今日请求",
+            (padding, y, padding + card_width, y + card_height),
+            14 * scale, self.COLORS["card_bg"], self.COLORS["card_border"])
+        draw.text((padding + 18 * scale, y + 14 * scale), "今日请求",
                   fill=self.COLORS["text_secondary"], font=font_small)
-        draw.text((padding + 16 * scale, y + 34 * scale), str(data.get("today_requests", 0)),
+        draw.text((padding + 18 * scale, y + 40 * scale), str(data.get("today_requests", 0)),
                   fill=self.COLORS["accent_purple"], font=font_large)
 
         # Token
         card_x2 = padding * 2 + card_width
         self._draw_rounded_rect(draw,
-            (card_x2, y, card_x2 + card_width, y + 80 * scale),
-            12 * scale, self.COLORS["card_bg"], self.COLORS["card_border"])
-        draw.text((card_x2 + 16 * scale, y + 12 * scale), "今日 Token",
+            (card_x2, y, card_x2 + card_width, y + card_height),
+            14 * scale, self.COLORS["card_bg"], self.COLORS["card_border"])
+        draw.text((card_x2 + 18 * scale, y + 14 * scale), "今日 Token",
                   fill=self.COLORS["text_secondary"], font=font_small)
-        draw.text((card_x2 + 16 * scale, y + 34 * scale), data.get("today_tokens", "0"),
+        draw.text((card_x2 + 18 * scale, y + 40 * scale), data.get("today_tokens", "0"),
                   fill=self.COLORS["accent_cyan"], font=font_large)
 
-        y += 96 * scale
+        # 模型数
+        card_x3 = padding * 3 + card_width * 2
+        self._draw_rounded_rect(draw,
+            (card_x3, y, card_x3 + card_width, y + card_height),
+            14 * scale, self.COLORS["card_bg"], self.COLORS["card_border"])
+        draw.text((card_x3 + 18 * scale, y + 14 * scale), "活跃模型",
+                  fill=self.COLORS["text_secondary"], font=font_small)
+        draw.text((card_x3 + 18 * scale, y + 40 * scale), str(len(model_stats)),
+                  fill=self.COLORS["accent_blue"], font=font_large)
+
+        y += card_height + 20 * scale
+
+        # Token 分解显示
+        if token_breakdown:
+            draw.text((padding, y), "Token 分解",
+                      fill=self.COLORS["text_secondary"], font=font_small)
+            y += 28 * scale
+
+            # 4个小卡片显示 input/output/reasoning/cached
+            token_items = [
+                ("输入", token_breakdown.get("input", "0"), self.COLORS["accent_blue"]),
+                ("输出", token_breakdown.get("output", "0"), self.COLORS["accent_green"]),
+                ("推理", token_breakdown.get("reasoning", "0"), self.COLORS["accent_purple"]),
+                ("缓存", token_breakdown.get("cached", "0"), self.COLORS["accent_cyan"]),
+            ]
+            
+            item_width = (width - padding * 5) // 4
+            for i, (label, value, color) in enumerate(token_items):
+                x = padding + i * (item_width + padding)
+                self._draw_rounded_rect(draw,
+                    (x, y, x + item_width, y + 48 * scale),
+                    10 * scale, self.COLORS["card_bg_light"])
+                draw.text((x + 12 * scale, y + 8 * scale), label,
+                          fill=self.COLORS["text_muted"], font=font_tiny)
+                draw.text((x + 12 * scale, y + 26 * scale), value,
+                          fill=color, font=font_small)
+            
+            y += 64 * scale
 
         # 模型统计
         if model_stats:
             draw.text((padding, y), "各模型详情",
                       fill=self.COLORS["text_secondary"], font=font_small)
-            y += 28 * scale
+            y += 30 * scale
 
             max_requests = max((m.get("requests", 0) for m in model_stats), default=1)
 
-            for model in model_stats[:10]:
+            for model in model_stats[:15]:
                 name = model.get("name", "")
-                if len(name) > 22:
-                    name = name[:20] + "..."
+                if len(name) > 28:
+                    name = name[:26] + "..."
                 requests = model.get("requests", 0)
                 tokens = model.get("tokens", "0")
                 failed = model.get("failed", 0)
 
                 # 模型名称
-                draw.text((padding + 8 * scale, y), name,
+                draw.text((padding + 10 * scale, y), name,
                           fill=self.COLORS["text_primary"], font=font_small)
 
                 # 统计信息
@@ -434,37 +530,66 @@ class StatsCardRenderer:
                 if failed > 0:
                     info_parts.append(f"失败 {failed}")
                 info_parts.append(tokens)
-                info_text = " / ".join(info_parts)
+                info_text = " | ".join(info_parts)
 
                 info_width = self._get_text_size(draw, info_text, font_tiny)[0]
 
                 # 失败高亮
-                if failed > 0:
-                    draw.text((width - padding - info_width - 8 * scale, y + 2 * scale), info_text,
-                              fill=self.COLORS["accent_orange"], font=font_tiny)
-                else:
-                    draw.text((width - padding - info_width - 8 * scale, y + 2 * scale), info_text,
-                              fill=self.COLORS["text_muted"], font=font_tiny)
+                text_color = self.COLORS["accent_orange"] if failed > 0 else self.COLORS["text_muted"]
+                draw.text((width - padding - info_width - 10 * scale, y + 3 * scale), info_text,
+                          fill=text_color, font=font_tiny)
 
                 # 进度条
-                bar_width = 50 * scale
-                bar_x = width - padding - info_width - bar_width - 20 * scale
+                bar_width = 60 * scale
+                bar_x = width - padding - info_width - bar_width - 24 * scale
                 percent = int(requests / max_requests * 100) if max_requests > 0 else 0
                 color = self.COLORS["accent_orange"] if failed > 0 else self.COLORS["accent_purple"]
-                self._draw_progress_bar(draw, bar_x, y + 6 * scale, bar_width, 8 * scale, percent, color)
+                self._draw_progress_bar(draw, bar_x, y + 6 * scale, bar_width, 10 * scale, percent, color)
 
-                y += 32 * scale
+                y += 34 * scale
 
-            y += 8 * scale
+            y += 12 * scale
+
+        # 凭证使用统计
+        if auth_stats:
+            draw.text((padding, y), "凭证使用",
+                      fill=self.COLORS["text_secondary"], font=font_small)
+            y += 28 * scale
+
+            for auth in auth_stats[:8]:
+                auth_id = auth.get("auth_index", "unknown")
+                if len(auth_id) > 20:
+                    auth_id = auth_id[:18] + "..."
+                requests = auth.get("requests", 0)
+                tokens = auth.get("tokens", "0")
+                failed = auth.get("failed", 0)
+
+                # 凭证标识
+                draw.text((padding + 10 * scale, y), auth_id,
+                          fill=self.COLORS["text_primary"], font=font_tiny)
+
+                # 统计
+                info_text = f"{requests} 次 | {tokens}"
+                if failed > 0:
+                    info_text += f" | 失败 {failed}"
+                info_width = self._get_text_size(draw, info_text, font_tiny)[0]
+                text_color = self.COLORS["accent_orange"] if failed > 0 else self.COLORS["text_muted"]
+                draw.text((width - padding - info_width - 10 * scale, y + 2 * scale), info_text,
+                          fill=text_color, font=font_tiny)
+
+                y += 30 * scale
+
+            y += 10 * scale
 
         # 时段分布
         if time_slots and sum(s.get("count", 0) for s in time_slots) > 0:
             draw.text((padding, y), "时段分布",
                       fill=self.COLORS["text_secondary"], font=font_small)
-            y += 28 * scale
+            y += 30 * scale
 
-            slot_width = (width - padding * 2 - 30 * scale) // 4
+            slot_width = (width - padding * 2 - 36 * scale) // 4
             max_count = max((s.get("count", 0) for s in time_slots), default=1)
+            bar_height = 60 * scale
 
             slot_colors = [
                 self.COLORS["accent_blue"],
@@ -474,12 +599,11 @@ class StatsCardRenderer:
             ]
 
             for i, slot in enumerate(time_slots):
-                x = padding + i * (slot_width + 10 * scale)
+                x = padding + i * (slot_width + 12 * scale)
                 count = slot.get("count", 0)
                 label = slot.get("label", "")
 
                 # 柱状图
-                bar_height = 50 * scale
                 if max_count > 0:
                     fill_height = int(bar_height * count / max_count)
                 else:
@@ -488,12 +612,12 @@ class StatsCardRenderer:
                 # 背景
                 self._draw_rounded_rect(draw,
                     (x, y, x + slot_width, y + bar_height),
-                    6 * scale, self.COLORS["progress_bg"])
+                    8 * scale, self.COLORS["progress_bg"])
 
                 # 填充
                 if fill_height > 0:
-                    fill_radius = min(6 * scale, fill_height // 2)
-                    if fill_height < 4 * scale:
+                    fill_radius = min(8 * scale, fill_height // 2)
+                    if fill_height < 6 * scale:
                         draw.rectangle(
                             [x, y + bar_height - fill_height, x + slot_width, y + bar_height],
                             fill=slot_colors[i])
@@ -503,181 +627,545 @@ class StatsCardRenderer:
                             fill_radius, slot_colors[i])
 
                 # 标签和数值
-                draw.text((x + 4 * scale, y + bar_height + 6 * scale), label[:4],
+                draw.text((x + 6 * scale, y + bar_height + 8 * scale), label[:4],
                           fill=self.COLORS["text_muted"], font=font_tiny)
                 count_text = str(count)
                 count_width = self._get_text_size(draw, count_text, font_tiny)[0]
-                draw.text((x + slot_width - count_width - 4 * scale, y + bar_height + 6 * scale),
+                draw.text((x + slot_width - count_width - 6 * scale, y + bar_height + 8 * scale),
                           count_text, fill=slot_colors[i], font=font_tiny)
 
-            y += bar_height + 28 * scale
+            y += bar_height + 32 * scale
 
         # 显示查询时间
         query_time = data.get("query_time", "")
         if query_time:
-            time_text = f"🔄 查询时间: {query_time}"
+            time_text = f"🔄 {query_time}"
             time_width = self._get_text_size(draw, time_text, font_small)[0]
             draw.text((width - padding - time_width, y),
                       time_text, fill=self.COLORS["accent_cyan"], font=font_small)
+            y += 20 * scale
+
+        # 裁剪到实际内容高度
+        img = self._crop_to_content(img, y, padding=16 * scale)
 
         return self._downscale_image(img)
 
     def render_quota(self, data: Dict[str, Any]) -> Image.Image:
-        """渲染配额状态卡片（支持多凭证类型）"""
-        base_width = 580  # 加宽卡片以容纳凭证标签
+        """渲染配额状态卡片（两列布局，更宽更短）"""
+        base_width = 880  # 加宽以支持两列
         scale = self.SCALE_FACTOR
-
+        
         accounts = data.get("accounts", [])
-
-        # 按凭证类型分组账号
+        
+        # 计算每个账号需要的高度
+        def calc_account_height(account: Dict[str, Any]) -> int:
+            if account.get("error"):
+                return 70  # 账号头部 + 错误信息
+            quotas = account.get("quotas", [])
+            # 头部 40 + 每个配额 44（标签一行 + 进度条一行）
+            return 48 + len(quotas) * 44
+        
+        # 按凭证类型分组
         provider_accounts: Dict[str, List[Dict[str, Any]]] = {}
         for account in accounts:
             provider = account.get("provider", "unknown")
             if provider not in provider_accounts:
                 provider_accounts[provider] = []
             provider_accounts[provider].append(account)
-
-        # 计算高度
-        base_height = 80  # 标题区域
+        
+        # 计算总高度（两列布局）
+        base_height = 90  # 标题区域
         for provider, accs in provider_accounts.items():
-            base_height += 40  # 凭证类型标题
-            for account in accs:
-                base_height += 54  # 账号头部（含凭证标签）
-                if account.get("error"):
-                    base_height += 30
-                else:
-                    base_height += len(account.get("quotas", [])) * 52
-                base_height += 12
-            base_height += 16  # 分组间距
+            base_height += 44  # 凭证类型标题
+            # 两列布局：每两个账号一行
+            row_heights = []
+            for i in range(0, len(accs), 2):
+                left_height = calc_account_height(accs[i])
+                right_height = calc_account_height(accs[i + 1]) if i + 1 < len(accs) else 0
+                row_heights.append(max(left_height, right_height) + 16)  # 行间距
+            base_height += sum(row_heights)
+            base_height += 12  # 分组间距
         base_height += 50  # 底部提示
-
+        
         width = base_width * scale
         height = base_height * scale
         padding = self.padding * scale
-
+        card_gap = 16 * scale  # 卡片间距
+        card_width = (width - padding * 2 - card_gap) // 2  # 每个卡片宽度
+        
         img = self._create_gradient_bg(width, height)
         draw = ImageDraw.Draw(img)
-
+        
         font_title = get_font(24 * scale)
-        font_section = get_font(18 * scale)
-        font_medium = get_font(16 * scale)
-        font_small = get_font(14 * scale)
-        font_tiny = get_font(12 * scale)
-        font_badge = get_font(10 * scale)
-
+        font_section = get_font(17 * scale)
+        font_medium = get_font(15 * scale)
+        font_small = get_font(13 * scale)
+        font_tiny = get_font(11 * scale)
+        
         y = padding
-
+        
         # 标题
         draw.text((padding, y), data.get("title", "OAuth 配额状态"),
                   fill=self.COLORS["text_primary"], font=font_title)
-
-        # 副标题（凭证统计摘要 + 查询时间）
+        
+        # 副标题 + 查询时间
         subtitle = data.get("subtitle", "")
         query_time = data.get("query_time", "")
         if query_time:
-            subtitle = f"{subtitle}  ⏱️ {query_time}" if subtitle else f"⏱️ {query_time}"
+            time_text = f"⏱️ {query_time}"
+            time_width = self._get_text_size(draw, time_text, font_small)[0]
+            draw.text((width - padding - time_width, y + 6 * scale),
+                      time_text, fill=self.COLORS["accent_cyan"], font=font_small)
         if subtitle:
-            draw.text((padding, y + 34 * scale), subtitle,
+            draw.text((padding, y + 36 * scale), subtitle,
                       fill=self.COLORS["text_secondary"], font=font_small)
-        y += 60 * scale
-
+        y += 70 * scale
+        
         # 按凭证类型渲染
         for provider, accs in provider_accounts.items():
             provider_color = self.PROVIDER_COLORS.get(provider, self.COLORS["accent_blue"])
             provider_name = accs[0].get("provider_name", provider.title()) if accs else provider.title()
             provider_icon = accs[0].get("provider_icon", "📦") if accs else "📦"
-
+            
             # 凭证类型分割线和标题
             draw.line([(padding, y), (width - padding, y)], fill=provider_color, width=2 * scale)
-            section_title = f"{provider_icon} {provider_name}"
-            draw.text((padding, y + 8 * scale), section_title,
+            section_title = f"{provider_icon} {provider_name} ({len(accs)})"
+            draw.text((padding, y + 10 * scale), section_title,
                       fill=provider_color, font=font_section)
-            y += 36 * scale
-
-            for account in accs:
-                # 账号卡片
-                quotas = account.get("quotas", [])
-                card_height = 48 * scale if account.get("error") else (48 + len(quotas) * 50) * scale
-
-                # 绘制卡片边框，使用凭证类型颜色
-                self._draw_rounded_rect(draw,
-                    (padding, y, width - padding, y + card_height),
-                    12 * scale, self.COLORS["card_bg"], provider_color)
-
-                # 账号头部
-                icon = account.get("icon", "")
-                email = account.get("email", "")
-
-                # 状态指示点
-                icon_color = self.COLORS["accent_green"] if icon == "✅" else self.COLORS["accent_red"]
-                draw.ellipse([padding + 16 * scale, y + 16 * scale, padding + 28 * scale, y + 28 * scale],
-                            fill=icon_color)
-
-                # 邮箱/名称
-                draw.text((padding + 38 * scale, y + 14 * scale), email,
-                          fill=self.COLORS["text_primary"], font=font_medium)
-
-                y += 44 * scale
-
-                if account.get("error"):
-                    draw.text((padding + 38 * scale, y - 18 * scale), f"⚠️ {account['error']}",
-                              fill=self.COLORS["accent_yellow"], font=font_small)
-                else:
-                    for quota in quotas:
-                        label = quota.get("label", "")
-                        percent = quota.get("percent", 0)
-                        reset_time = quota.get("reset_time", "")
-
-                        # 确定颜色
-                        if percent >= 80:
-                            bar_color = self.COLORS["accent_green"]
-                        elif percent >= 50:
-                            bar_color = self.COLORS["accent_yellow"]
-                        elif percent >= 20:
-                            bar_color = self.COLORS["accent_orange"]
-                        else:
-                            bar_color = self.COLORS["accent_red"]
-
-                        # 第一行：标签 + 进度条 + 百分比
-                        draw.text((padding + 20 * scale, y), label,
-                                  fill=self.COLORS["text_secondary"], font=font_small)
-
-                        # 进度条（位置调整）
-                        bar_x = padding + 150 * scale
-                        bar_width_val = 200 * scale
-                        self._draw_progress_bar(draw, bar_x, y + 4 * scale, bar_width_val, 14 * scale, percent, bar_color)
-
-                        # 百分比（紧跟进度条后面）
-                        percent_text = f"{percent}%"
-                        draw.text((bar_x + bar_width_val + 12 * scale, y), percent_text,
-                                  fill=bar_color, font=font_small)
-
-                        # 第二行：刷新时间（右对齐，在进度条下方）
-                        reset_text = f"刷新: {reset_time}"
-                        reset_width = self._get_text_size(draw, reset_text, font_tiny)[0]
-                        draw.text((width - padding - reset_width - 20 * scale, y + 22 * scale),
-                                  reset_text, fill=self.COLORS["text_muted"], font=font_tiny)
-
-                        y += 48 * scale
-
-                y += 14 * scale
-
+            y += 40 * scale
+            
+            # 两列布局渲染账号
+            for i in range(0, len(accs), 2):
+                left_account = accs[i]
+                right_account = accs[i + 1] if i + 1 < len(accs) else None
+                
+                left_height = calc_account_height(left_account) * scale
+                right_height = (calc_account_height(right_account) * scale) if right_account else 0
+                row_height = max(left_height, right_height)
+                
+                # 渲染左侧卡片
+                self._render_account_card(draw, padding, y, card_width, left_height,
+                                         left_account, provider_color, scale,
+                                         font_medium, font_small, font_tiny)
+                
+                # 渲染右侧卡片
+                if right_account:
+                    right_x = padding + card_width + card_gap
+                    self._render_account_card(draw, right_x, y, card_width, right_height,
+                                             right_account, provider_color, scale,
+                                             font_medium, font_small, font_tiny)
+                
+                y += row_height + 14 * scale
+            
             y += 8 * scale  # 凭证类型分组间距
-
-        # 底部提示和查询时间
+        
+        # 底部提示
         tip_text = "💡 配额每日自动刷新，百分比为剩余额度"
         draw.text((padding, y), tip_text,
                   fill=self.COLORS["text_muted"], font=font_small)
+        
+        # 计算实际内容结束位置并裁剪
+        final_y = y + 24 * scale  # 提示文字高度
+        img = self._crop_to_content(img, final_y, padding=16 * scale)
+        
+        return self._downscale_image(img)
+    
+    def _render_account_card(self, draw: ImageDraw.Draw, x: int, y: int, 
+                             card_width: int, card_height: int,
+                             account: Dict[str, Any], provider_color: Tuple[int, int, int],
+                             scale: int, font_medium, font_small, font_tiny):
+        """渲染单个账号卡片"""
+        card_padding = 14 * scale
+        
+        # 绘制卡片背景
+        self._draw_rounded_rect(draw,
+            (x, y, x + card_width, y + card_height),
+            10 * scale, self.COLORS["card_bg"], self.COLORS["card_border"])
+        
+        # 账号头部
+        icon = account.get("icon", "")
+        email = account.get("email", "")
+        
+        # 状态指示点
+        icon_color = self.COLORS["accent_green"] if icon == "✅" else self.COLORS["accent_red"]
+        draw.ellipse([x + card_padding, y + card_padding + 2 * scale, 
+                      x + card_padding + 10 * scale, y + card_padding + 12 * scale],
+                    fill=icon_color)
+        
+        # 邮箱/名称（截断过长的文本）
+        max_email_width = card_width - card_padding * 3 - 10 * scale
+        display_email = email
+        email_width = self._get_text_size(draw, display_email, font_medium)[0]
+        while email_width > max_email_width and len(display_email) > 10:
+            display_email = display_email[:-4] + "..."
+            email_width = self._get_text_size(draw, display_email, font_medium)[0]
+        
+        draw.text((x + card_padding + 16 * scale, y + card_padding),
+                  display_email, fill=self.COLORS["text_primary"], font=font_medium)
+        
+        inner_y = y + card_padding + 28 * scale
+        
+        if account.get("error"):
+            draw.text((x + card_padding, inner_y), f"⚠️ {account['error']}",
+                      fill=self.COLORS["accent_yellow"], font=font_small)
+        else:
+            quotas = account.get("quotas", [])
+            for quota in quotas:
+                label = quota.get("label", "")
+                percent = quota.get("percent", 0)
+                reset_time = quota.get("reset_time", "")
+                
+                # 确定颜色
+                if percent >= 80:
+                    bar_color = self.COLORS["accent_green"]
+                elif percent >= 50:
+                    bar_color = self.COLORS["accent_yellow"]
+                elif percent >= 20:
+                    bar_color = self.COLORS["accent_orange"]
+                else:
+                    bar_color = self.COLORS["accent_red"]
+                
+                # 第一行：标签（完整显示，不被挡住）
+                # 截断过长的标签
+                max_label_width = card_width - card_padding * 2 - 80 * scale
+                display_label = label
+                label_width = self._get_text_size(draw, display_label, font_small)[0]
+                while label_width > max_label_width and len(display_label) > 8:
+                    display_label = display_label[:-4] + "..."
+                    label_width = self._get_text_size(draw, display_label, font_small)[0]
+                
+                draw.text((x + card_padding, inner_y), display_label,
+                          fill=self.COLORS["text_secondary"], font=font_small)
+                
+                # 百分比（右对齐，同一行）
+                percent_text = f"{percent}%"
+                percent_width = self._get_text_size(draw, percent_text, font_small)[0]
+                draw.text((x + card_width - card_padding - percent_width, inner_y),
+                          percent_text, fill=bar_color, font=font_small)
+                
+                inner_y += 18 * scale
+                
+                # 第二行：进度条 + 刷新时间
+                bar_width = card_width - card_padding * 2 - 100 * scale
+                self._draw_progress_bar(draw, x + card_padding, inner_y, 
+                                       bar_width, 10 * scale, percent, bar_color)
+                
+                # 刷新时间（右对齐）
+                reset_text = reset_time
+                reset_width = self._get_text_size(draw, reset_text, font_tiny)[0]
+                draw.text((x + card_width - card_padding - reset_width, inner_y - 2 * scale),
+                          reset_text, fill=self.COLORS["text_muted"], font=font_tiny)
+                
+                inner_y += 22 * scale
 
-        # 右下角显示查询时间（更醒目）
+    def render_dashboard(self, data: Dict[str, Any]) -> Image.Image:
+        """渲染综合仪表盘 - 简化版：垂直布局，自适应高度"""
+        base_width = 800  # 单列布局，更紧凑
+        scale = self.SCALE_FACTOR
+        
+        today_data = data.get("today", {})
+        quota_data = data.get("quota", {})
+        analysis_text = data.get("analysis", "")
+        
+        model_stats = today_data.get("model_stats") or []
+        accounts = quota_data.get("accounts", [])
+        
+        # 按凭证类型分组账号
+        provider_groups: Dict[str, List[Dict[str, Any]]] = {}
+        for account in accounts:
+            provider = account.get("provider", "unknown")
+            if provider not in provider_groups:
+                provider_groups[provider] = []
+            provider_groups[provider].append(account)
+        
+        # 使用足够大的画布（后续裁剪）
+        max_height = 5000
+        width = base_width * scale
+        height = max_height * scale
+        padding = 24 * scale
+        
+        img = self._create_gradient_bg(width, height)
+        draw = ImageDraw.Draw(img)
+        
+        # 字体
+        font_title = get_font(24 * scale)
+        font_section = get_font(16 * scale)
+        font_medium = get_font(14 * scale)
+        font_small = get_font(12 * scale)
+        font_tiny = get_font(10 * scale)
+        
+        y = padding
+        
+        # ========== 1. 标题区域 ==========
+        draw.text((padding, y), "📊 CLIProxyAPI 综合仪表盘",
+                  fill=self.COLORS["text_primary"], font=font_title)
+        
         query_time = data.get("query_time", "")
         if query_time:
-            time_text = f"🔄 查询时间: {query_time}"
+            time_text = f"⏱️ {query_time}"
             time_width = self._get_text_size(draw, time_text, font_small)[0]
-            draw.text((width - padding - time_width, y),
+            draw.text((width - padding - time_width, y + 4 * scale),
                       time_text, fill=self.COLORS["accent_cyan"], font=font_small)
-
+        
+        subtitle = today_data.get("subtitle", "")
+        if subtitle:
+            draw.text((padding, y + 30 * scale), f"📅 {subtitle}",
+                      fill=self.COLORS["text_secondary"], font=font_small)
+        
+        y += 52 * scale
+        
+        # ========== 2. 核心指标（横向5个小卡片） ==========
+        card_gap = 10 * scale
+        card_width = (width - padding * 2 - card_gap * 4) // 5
+        card_height = 54 * scale
+        
+        metrics = [
+            ("请求", str(today_data.get("today_requests", 0)), self.COLORS["accent_purple"]),
+            ("Token", today_data.get("today_tokens", "0"), self.COLORS["accent_cyan"]),
+            ("成功率", f"{today_data.get('success_rate', 100)}%", self.COLORS["accent_green"]),
+            ("模型", str(len(model_stats)), self.COLORS["accent_blue"]),
+            ("账号", str(len(accounts)), self.COLORS["accent_orange"]),
+        ]
+        
+        for i, (label, value, color) in enumerate(metrics):
+            x = padding + i * (card_width + card_gap)
+            self._draw_rounded_rect(draw,
+                (x, y, x + card_width, y + card_height),
+                8 * scale, self.COLORS["card_bg"], self.COLORS["card_border"])
+            draw.text((x + 8 * scale, y + 6 * scale), label,
+                      fill=self.COLORS["text_muted"], font=font_tiny)
+            draw.text((x + 8 * scale, y + 22 * scale), value,
+                      fill=color, font=font_section)
+        
+        y += card_height + 16 * scale
+        
+        # ========== 3. 模型使用 TOP ==========
+        section_start = y
+        draw.text((padding, y), "🔥 模型使用 TOP",
+                  fill=self.COLORS["text_primary"], font=font_section)
+        y += 28 * scale
+        
+        if model_stats:
+            max_requests = max((m.get("requests", 0) for m in model_stats), default=1)
+            for m in model_stats[:12]:  # 最多12个
+                name = m.get("name", "")
+                if len(name) > 35:
+                    name = name[:33] + ".."
+                requests = m.get("requests", 0)
+                tokens = m.get("tokens", "0")
+                
+                draw.text((padding + 8 * scale, y), name,
+                          fill=self.COLORS["text_secondary"], font=font_small)
+                
+                info_text = f"{requests} | {tokens}"
+                info_width = self._get_text_size(draw, info_text, font_tiny)[0]
+                draw.text((width - padding - info_width, y + 2 * scale),
+                          info_text, fill=self.COLORS["text_muted"], font=font_tiny)
+                
+                y += 22 * scale
+        
+        # Token 分解
+        token_breakdown = today_data.get("token_breakdown")
+        if token_breakdown:
+            y += 8 * scale
+            draw.line([(padding, y), (width - padding, y)],
+                     fill=self.COLORS["divider"], width=1)
+            y += 10 * scale
+            
+            token_items = [
+                ("输入", token_breakdown.get("input", "0"), self.COLORS["accent_blue"]),
+                ("输出", token_breakdown.get("output", "0"), self.COLORS["accent_green"]),
+                ("推理", token_breakdown.get("reasoning", "0"), self.COLORS["accent_purple"]),
+                ("缓存", token_breakdown.get("cached", "0"), self.COLORS["accent_cyan"]),
+            ]
+            
+            item_width = (width - padding * 2) // 4
+            for i, (label, value, color) in enumerate(token_items):
+                ix = padding + i * item_width
+                draw.text((ix, y), label, fill=self.COLORS["text_muted"], font=font_tiny)
+                draw.text((ix + 36 * scale, y), value, fill=color, font=font_small)
+            
+            y += 20 * scale
+        
+        y += 16 * scale
+        
+        # ========== 4. 配额状态 ==========
+        draw.text((padding, y), "⚡ 配额状态",
+                  fill=self.COLORS["text_primary"], font=font_section)
+        y += 28 * scale
+        
+        for provider, accs in provider_groups.items():
+            provider_color = self.PROVIDER_COLORS.get(provider, self.COLORS["accent_blue"])
+            provider_name = accs[0].get("provider_name", provider.title()) if accs else provider
+            provider_icon = accs[0].get("provider_icon", "📦") if accs else "📦"
+            
+            draw.text((padding + 8 * scale, y), f"{provider_icon} {provider_name}",
+                      fill=provider_color, font=font_small)
+            y += 22 * scale
+            
+            for acc in accs:
+                email = acc.get("email", "未知")
+                if len(email) > 28:
+                    email = email[:26] + ".."
+                icon = acc.get("icon", "")
+                icon_color = self.COLORS["accent_green"] if icon == "✅" else self.COLORS["accent_red"]
+                
+                draw.ellipse([padding + 16 * scale, y + 3 * scale, 
+                             padding + 22 * scale, y + 9 * scale], fill=icon_color)
+                draw.text((padding + 28 * scale, y), email,
+                          fill=self.COLORS["text_muted"], font=font_tiny)
+                y += 16 * scale
+                
+                for q in acc.get("quotas", []):
+                    label = q.get("label", "")
+                    if len(label) > 20:
+                        label = label[:18] + ".."
+                    percent = q.get("percent", 0)
+                    
+                    if percent >= 80:
+                        bar_color = self.COLORS["accent_green"]
+                    elif percent >= 50:
+                        bar_color = self.COLORS["accent_yellow"]
+                    elif percent >= 20:
+                        bar_color = self.COLORS["accent_orange"]
+                    else:
+                        bar_color = self.COLORS["accent_red"]
+                    
+                    draw.text((padding + 28 * scale, y), label,
+                              fill=self.COLORS["text_muted"], font=font_tiny)
+                    
+                    bar_x = padding + 180 * scale
+                    bar_w = 80 * scale
+                    self._draw_progress_bar(draw, bar_x, y + 2 * scale, bar_w, 8 * scale, percent, bar_color)
+                    
+                    draw.text((bar_x + bar_w + 8 * scale, y), f"{percent}%",
+                              fill=bar_color, font=font_tiny)
+                    
+                    reset_time = q.get("reset_time", "")
+                    if reset_time:
+                        reset_width = self._get_text_size(draw, reset_time, font_tiny)[0]
+                        draw.text((width - padding - reset_width, y),
+                                  reset_time, fill=self.COLORS["text_muted"], font=font_tiny)
+                    
+                    y += 16 * scale
+                
+                y += 6 * scale
+            
+            y += 8 * scale
+        
+        y += 8 * scale
+        
+        # ========== 5. 时段分布 ==========
+        time_slots = today_data.get("time_slots") or []
+        if time_slots and sum(s.get("count", 0) for s in time_slots) > 0:
+            draw.text((padding, y), "📈 时段分布",
+                      fill=self.COLORS["text_primary"], font=font_section)
+            y += 28 * scale
+            
+            bar_height = 60 * scale
+            slot_gap = 12 * scale
+            slot_width = (width - padding * 2 - slot_gap * 3) // 4
+            max_count = max((s.get("count", 0) for s in time_slots), default=1)
+            
+            slot_colors = [
+                self.COLORS["accent_blue"],
+                self.COLORS["accent_cyan"],
+                self.COLORS["accent_purple"],
+                self.COLORS["accent_orange"]
+            ]
+            
+            for i, slot in enumerate(time_slots[:4]):
+                sx = padding + i * (slot_width + slot_gap)
+                count = slot.get("count", 0)
+                label = slot.get("label", "")
+                
+                if max_count > 0:
+                    fill_height = int(bar_height * count / max_count)
+                else:
+                    fill_height = 0
+                
+                self._draw_rounded_rect(draw,
+                    (sx, y, sx + slot_width, y + bar_height),
+                    6 * scale, self.COLORS["progress_bg"])
+                
+                if fill_height > 6 * scale:
+                    self._draw_rounded_rect(draw,
+                        (sx, y + bar_height - fill_height, sx + slot_width, y + bar_height),
+                        6 * scale, slot_colors[i])
+                
+                # 标签在柱状图下方
+                draw.text((sx + 4 * scale, y + bar_height + 6 * scale), label,
+                          fill=self.COLORS["text_muted"], font=font_tiny)
+                count_text = str(count)
+                count_width = self._get_text_size(draw, count_text, font_small)[0]
+                draw.text((sx + slot_width - count_width - 4 * scale, y + bar_height + 6 * scale),
+                          count_text, fill=slot_colors[i], font=font_small)
+            
+            y += bar_height + 28 * scale
+        
+        y += 8 * scale
+        
+        # ========== 6. AI 分析 ==========
+        if analysis_text:
+            draw.text((padding, y), "🤖 AI 智能分析",
+                      fill=self.COLORS["text_primary"], font=font_section)
+            y += 28 * scale
+            
+            max_text_width = width - padding * 2 - 16 * scale
+            lines = self._wrap_text(analysis_text, font_tiny, max_text_width, draw)
+            
+            for line in lines:
+                if line.strip().startswith("###"):
+                    title_line = line.replace("###", "").strip()
+                    y += 6 * scale
+                    draw.text((padding + 8 * scale, y), title_line,
+                              fill=self.COLORS["accent_cyan"], font=font_small)
+                    y += 18 * scale
+                elif line.strip().startswith("**") and line.strip().endswith("**"):
+                    # 加粗文本
+                    bold_text = line.strip().strip("*")
+                    draw.text((padding + 8 * scale, y), bold_text,
+                              fill=self.COLORS["text_primary"], font=font_small)
+                    y += 16 * scale
+                elif line.strip():
+                    draw.text((padding + 8 * scale, y), line,
+                              fill=self.COLORS["text_secondary"], font=font_tiny)
+                    y += 14 * scale
+                else:
+                    y += 8 * scale  # 空行
+        
+        y += 16 * scale
+        
+        # 裁剪到实际内容
+        img = self._crop_to_content(img, y, padding=8 * scale)
+        
         return self._downscale_image(img)
+    
+    def _wrap_text(self, text: str, font, max_width: int, draw: ImageDraw.Draw) -> List[str]:
+        """文本自动换行"""
+        lines = []
+        for paragraph in text.split('\n'):
+            if not paragraph.strip():
+                lines.append("")
+                continue
+            
+            words = list(paragraph)
+            current_line = ""
+            
+            for char in words:
+                test_line = current_line + char
+                width = self._get_text_size(draw, test_line, font)[0]
+                if width <= max_width:
+                    current_line = test_line
+                else:
+                    if current_line:
+                        lines.append(current_line)
+                    current_line = char
+            
+            if current_line:
+                lines.append(current_line)
+        
+        return lines
 
     def render(self, data: Dict[str, Any]) -> Optional[Image.Image]:
         """根据数据类型渲染对应的卡片"""
@@ -689,5 +1177,7 @@ class StatsCardRenderer:
             return self.render_today(data)
         elif stats_type == "quota":
             return self.render_quota(data)
+        elif stats_type == "dashboard":
+            return self.render_dashboard(data)
 
         return None

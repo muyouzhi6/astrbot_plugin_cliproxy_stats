@@ -1,20 +1,38 @@
 {
   "cpa_url": {
-    "description": "CLIProxyAPI 服务地址 (如 https://example.com)",
+    "description": "CLIProxyAPI 服务地址",
     "type": "string",
-    "hint": "不包含路径，只需要协议和域名",
+    "hint": "如 https://your-cpa-server.com，不包含路径",
     "default": ""
   },
   "cpa_password": {
     "description": "CLIProxyAPI 管理密码",
     "type": "string",
-    "hint": "用于访问管理 API 的密码",
+    "hint": "用于访问 /v0/management API 的密码",
     "default": ""
   },
   "verify_ssl": {
-    "description": "是否验证 SSL 证书",
+    "description": "验证 SSL 证书",
     "type": "bool",
-    "hint": "如果 CPA 使用自签名证书，可以关闭此选项",
+    "hint": "自签名证书请关闭此选项",
     "default": false
+  },
+  "enable_llm_analysis": {
+    "description": "启用 LLM 智能分析",
+    "type": "bool",
+    "hint": "使用 /cpa分析 命令获取 AI 分析报告。需先配置下方的服务商 ID",
+    "default": false
+  },
+  "llm_provider_id": {
+    "description": "LLM 分析服务商 ID",
+    "type": "string",
+    "hint": "发送 /cpa服务商 查看可用列表。留空使用当前对话模型",
+    "default": ""
+  },
+  "high_res_render": {
+    "description": "高分辨率渲染",
+    "type": "bool",
+    "hint": "生成更清晰的统计图片（3x 渲染），关闭则使用 2x",
+    "default": true
   }
 }

@@ -2,18 +2,23 @@
 CLIProxyAPI 额度与使用统计查询插件
 支持查看 OAuth 模型额度和当日调用统计
 输出渲染为现代卡片风格图片
+支持 LLM 智能分析使用情况
 """
 
 import aiohttp
+from aiohttp import ClientTimeout
 import asyncio
 import json
 import os
+import re
 from datetime import datetime, date
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 from astrbot.api.star import Star, Context
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api import logger, AstrBotConfig
+from astrbot.api.message_components import Plain, Image
+from astrbot.core.provider.provider import Provider
 
 # 导入自定义统计卡片渲染器
 from .stats_renderer import StatsCardRenderer
@@ -109,14 +114,59 @@ GEMINI_CLI_QUOTA_GROUPS = [
 
 # 凭证类型显示名称和图标
 PROVIDER_INFO = {
-    "antigravity": {"name": "Antigravity", "icon": "🚀", "color": "#8b5cf6"},
-    "gemini": {"name": "GeminiCLI", "icon": "💎", "color": "#3b82f6"},
-    "gemini-cli": {"name": "GeminiCLI", "icon": "💎", "color": "#3b82f6"},  # CPA 内部使用的名称
-    "claude": {"name": "Claude", "icon": "🤖", "color": "#f59e0b"},
-    "codex": {"name": "Codex", "icon": "🔮", "color": "#10b981"},
-    "iflow": {"name": "iFlow", "icon": "🌊", "color": "#06b6d4"},
-    "qwen": {"name": "Qwen", "icon": "🌙", "color": "#ec4899"}
+    "antigravity": {"name": "Antigravity", "icon": "🚀", "color": "#8b5cf6", "supports_quota": True},
+    "gemini": {"name": "GeminiCLI", "icon": "💎", "color": "#3b82f6", "supports_quota": True},
+    "gemini-cli": {"name": "GeminiCLI", "icon": "💎", "color": "#3b82f6", "supports_quota": True},
+    "claude": {"name": "Claude", "icon": "🤖", "color": "#f59e0b", "supports_quota": False},
+    "codex": {"name": "Codex", "icon": "🔮", "color": "#10b981", "supports_quota": False},
+    "iflow": {"name": "iFlow", "icon": "🌊", "color": "#06b6d4", "supports_quota": False},
+    "qwen": {"name": "Qwen", "icon": "🌙", "color": "#ec4899", "supports_quota": False}
 }
+
+# LLM 分析 prompt 模板
+LLM_ANALYSIS_PROMPT = """你是一个 API 使用分析专家。请根据以下 CLIProxyAPI 使用数据，提供精准的分析报告。
+
+## 当前时间
+{current_time}
+
+## 今日使用数据
+- 日期: {date}
+- 总请求数: {total_requests}
+- 总 Token: {total_tokens}
+- 成功率: {success_rate}%
+- 已运行时长: 从 00:00 到现在约 {hours_elapsed} 小时
+
+## 各模型使用详情
+{model_stats}
+
+## 配额状态（含刷新时间）
+{quota_stats}
+
+## 小时级使用分布
+{hourly_distribution}
+
+请提供以下分析：
+
+### 1. 配额安全评估（最重要）
+对于每个配额紧张的模型（剩余 < 80%）：
+- 计算：当前消耗速率 = 已用配额 / 已运行小时数
+- 计算：预计耗尽时间 = 剩余配额 / 消耗速率
+- **关键判断**：在该模型的刷新时间之前，配额是否会耗尽？
+  - 如果刷新时间在耗尽之前 → ✅ 安全，无需担心
+  - 如果耗尽在刷新之前 → ⚠️ 预警，给出预计耗尽时间
+- 配额充足（> 80%）的模型不需要预警
+
+### 2. 模型使用分析
+- 哪个模型是主力？占比多少？
+- 各模型的平均单次 Token 消耗
+- 是否有异常高消耗的模型？
+
+### 3. 优化建议（仅在必要时给出）
+- **只有当配额确实会在刷新前耗尽时**，才建议切换模型
+- 如果配额安全，明确说"当前使用模式可持续，无需调整"
+- 不要为了建议而建议
+
+请用中文回答，数据要准确，结论要明确。"""
 
 
 class CPAClient:
@@ -158,7 +208,7 @@ class CPAClient:
         url = f"{self.base_url}/v0/management/usage"
         try:
             session = await self._get_session()
-            async with session.get(url, headers=self._get_headers(), timeout=30) as resp:
+            async with session.get(url, headers=self._get_headers(), timeout=ClientTimeout(total=30)) as resp:
                 if resp.status == 200:
                     return await resp.json()
                 else:
@@ -174,7 +224,7 @@ class CPAClient:
         url = f"{self.base_url}/v0/management/auth-files"
         try:
             session = await self._get_session()
-            async with session.get(url, headers=self._get_headers(), timeout=30) as resp:
+            async with session.get(url, headers=self._get_headers(), timeout=ClientTimeout(total=30)) as resp:
                 if resp.status == 200:
                     return await resp.json()
                 else:
@@ -199,7 +249,7 @@ class CPAClient:
         try:
             session = await self._get_session()
             async with session.post(api_url, headers=self._get_headers(),
-                                    json=payload, timeout=60) as resp:
+                                    json=payload, timeout=ClientTimeout(total=60)) as resp:
                 if resp.status == 200:
                     result = await resp.json()
                     # 解析 body（先检查类型）
@@ -368,15 +418,53 @@ class Main(Star):
         self.cpa_url = self.config.get("cpa_url", "")
         self.cpa_password = self.config.get("cpa_password", "")
         self.verify_ssl = self.config.get("verify_ssl", False)
+        self.enable_llm_analysis = self.config.get("enable_llm_analysis", False)
+        self.llm_provider_id = self.config.get("llm_provider_id", "")
+        self.high_res_render = self.config.get("high_res_render", True)
         self._client: Optional[CPAClient] = None
         self._renderer: Optional[StatsCardRenderer] = None
+
+    def _get_llm_provider(self) -> Optional[Provider]:
+        """获取用于 LLM 分析的 Provider"""
+        if not self.enable_llm_analysis:
+            return None
+        
+        try:
+            if self.llm_provider_id:
+                # 使用指定的 Provider ID
+                provider = self.context.get_provider_by_id(self.llm_provider_id)
+                if provider:
+                    return provider
+                logger.warning(f"未找到指定的 Provider: {self.llm_provider_id}，将使用当前对话模型")
+            
+            # 使用当前对话模型
+            return self.context.get_using_provider()
+        except Exception as e:
+            logger.error(f"获取 LLM Provider 失败: {e}")
+            return None
+
+    def _get_available_providers(self) -> List[Dict[str, str]]:
+        """获取所有可用的 LLM Provider 列表（用于配置面板下拉选择）"""
+        try:
+            providers = self.context.get_all_providers()
+            result = []
+            for p in providers:
+                try:
+                    meta = p.meta()
+                    result.append({"id": meta.id, "name": f"{meta.id} ({meta.model})"})
+                except Exception:
+                    pass
+            return result
+        except Exception as e:
+            logger.error(f"获取 Provider 列表失败: {e}")
+            return []
 
     async def _render_image(self, data: dict) -> Optional[str]:
         """使用自定义渲染器将统计数据转换为美观的卡片图片"""
         try:
-            # 复用渲染器实例
+            # 复用渲染器实例（配置变更时重建）
             if self._renderer is None:
-                self._renderer = StatsCardRenderer()
+                self._renderer = StatsCardRenderer(high_res=self.high_res_render)
             img = self._renderer.render(data)
 
             if img is None:
@@ -494,6 +582,50 @@ class Main(Star):
             "qwen": "Qwen"
         }
         return mapping.get(provider.lower(), provider)
+
+    def _parse_quota_dynamic(self, models: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """动态解析配额信息，显示所有可用模型（不限于预设列表）"""
+        quotas = []
+        
+        for model_id, entry in models.items():
+            quota_info = entry.get("quotaInfo", entry.get("quota_info", {}))
+            remaining = quota_info.get("remainingFraction", quota_info.get("remaining_fraction"))
+            reset_time = quota_info.get("resetTime", quota_info.get("reset_time"))
+            
+            if remaining is not None:
+                quotas.append({
+                    "id": model_id,
+                    "label": model_id,
+                    "remaining_percent": round(remaining * 100),
+                    "reset_time": reset_time,
+                    "models": [model_id]
+                })
+        
+        # 按剩余配额排序（低的在前，便于关注）
+        quotas.sort(key=lambda x: x["remaining_percent"])
+        return quotas
+
+    def _parse_gemini_cli_quota_dynamic(self, buckets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """动态解析 GeminiCLI 配额信息（显示所有模型）"""
+        quotas = []
+        
+        for bucket in buckets:
+            model_id = bucket.get("modelId", "")
+            remaining = bucket.get("remainingFraction")
+            reset_time = bucket.get("resetTime")
+            
+            if model_id and remaining is not None:
+                quotas.append({
+                    "id": model_id,
+                    "label": model_id,
+                    "remaining_percent": round(remaining * 100),
+                    "reset_time": reset_time,
+                    "models": [model_id]
+                })
+        
+        # 按剩余配额排序
+        quotas.sort(key=lambda x: x["remaining_percent"])
+        return quotas
 
     def _parse_quota(self, models: Dict[str, Any]) -> List[Dict[str, Any]]:
         """解析配额信息，返回按分组聚合的配额列表 (通用方法，支持所有 Google Cloud Code 凭证)"""
@@ -691,6 +823,46 @@ class Main(Star):
         # 后备：纯文本
         yield event.plain_result(await self._get_today_stats(client))
 
+    @filter.command("cpa总览")
+    async def cpa_dashboard(self, event: AstrMessageEvent):
+        """查看综合仪表盘（整合今日统计 + 配额状态 + AI分析）"""
+        client = self._get_client()
+        if not client:
+            yield event.plain_result("❌ 未配置 CLIProxyAPI 地址或密码，请在插件配置中设置")
+            return
+
+        yield event.plain_result("📊 正在生成综合仪表盘，请稍候...")
+
+        # 并行获取所有数据
+        today_data = await self._build_today_data(client)
+        quota_data = await self._build_quota_data(client)
+        
+        # 获取 LLM 分析（如果启用）
+        analysis_text = ""
+        if self.enable_llm_analysis and today_data:
+            analysis_text = await self._generate_llm_analysis(today_data, quota_data) or ""
+
+        if not today_data:
+            yield event.plain_result("❌ 获取使用数据失败")
+            return
+
+        # 构建仪表盘数据
+        dashboard_data = {
+            "stats_type": "dashboard",
+            "today": today_data,
+            "quota": quota_data or {},
+            "analysis": analysis_text,
+            "query_time": datetime.now().strftime("%H:%M:%S")
+        }
+
+        # 渲染图片
+        image_path = await self._render_image(dashboard_data)
+        if image_path:
+            yield event.image_result(image_path)
+        else:
+            # 后备：纯文本
+            yield event.plain_result("❌ 仪表盘渲染失败，请查看日志")
+
     async def _build_overview_data(self, client: CPAClient) -> Optional[Dict[str, Any]]:
         """构建总览页面的模板数据"""
         usage_data = await client.get_usage()
@@ -765,7 +937,7 @@ class Main(Star):
         }
 
     async def _build_today_data(self, client: CPAClient) -> Optional[Dict[str, Any]]:
-        """构建今日统计的模板数据"""
+        """构建今日统计的模板数据（增强版：包含 Token 分解和凭证统计）"""
         usage_data = await client.get_usage()
 
         if not usage_data:
@@ -780,40 +952,105 @@ class Main(Star):
         today_requests = requests_by_day.get(today, 0)
         today_tokens = tokens_by_day.get(today, 0)
 
-        # 各模型今日统计
+        # 各模型今日统计 + Token 分解 + 凭证统计
         apis = usage.get("apis", {})
         model_stats = []
         today_by_hour: Dict[int, int] = {h: 0 for h in range(24)}
+        
+        # 凭证使用统计
+        auth_usage: Dict[str, Dict[str, Any]] = {}
+        
+        # Token 分解统计
+        total_input_tokens = 0
+        total_output_tokens = 0
+        total_reasoning_tokens = 0
+        total_cached_tokens = 0
 
         if apis:
-            model_today_stats: List[tuple] = []
+            # 聚合所有模型的今日统计
+            model_aggregated: Dict[str, Dict[str, Any]] = {}
+            
             for api_name, api_data in apis.items():
                 models = api_data.get("models", {})
                 for model_name, model_data in models.items():
                     details = model_data.get("details", [])
-                    today_details = [d for d in details if d.get("timestamp", "").startswith(today)]
+                    today_details = [d for d in details if str(d.get("timestamp", "")).startswith(today)]
+                    
                     if today_details:
-                        today_req = len(today_details)
-                        today_tok = sum(d.get("tokens", {}).get("total_tokens", 0) for d in today_details)
-                        today_failed = sum(1 for d in today_details if d.get("failed", False))
-                        model_today_stats.append((model_name, today_req, today_tok, today_failed))
-
-                        # 统计小时分布
+                        # 聚合模型统计
+                        if model_name not in model_aggregated:
+                            model_aggregated[model_name] = {
+                                "requests": 0,
+                                "tokens": 0,
+                                "failed": 0,
+                                "input_tokens": 0,
+                                "output_tokens": 0,
+                                "reasoning_tokens": 0,
+                                "cached_tokens": 0
+                            }
+                        
                         for d in today_details:
-                            timestamp = d.get("timestamp", "")
+                            model_aggregated[model_name]["requests"] += 1
+                            tokens_info = d.get("tokens", {})
+                            
+                            # Token 分解
+                            input_tok = tokens_info.get("input_tokens", 0)
+                            output_tok = tokens_info.get("output_tokens", 0)
+                            reasoning_tok = tokens_info.get("reasoning_tokens", 0)
+                            cached_tok = tokens_info.get("cached_tokens", 0)
+                            total_tok = tokens_info.get("total_tokens", 0)
+                            
+                            model_aggregated[model_name]["tokens"] += total_tok
+                            model_aggregated[model_name]["input_tokens"] += input_tok
+                            model_aggregated[model_name]["output_tokens"] += output_tok
+                            model_aggregated[model_name]["reasoning_tokens"] += reasoning_tok
+                            model_aggregated[model_name]["cached_tokens"] += cached_tok
+                            
+                            # 全局 Token 统计
+                            total_input_tokens += input_tok
+                            total_output_tokens += output_tok
+                            total_reasoning_tokens += reasoning_tok
+                            total_cached_tokens += cached_tok
+                            
+                            if d.get("failed", False):
+                                model_aggregated[model_name]["failed"] += 1
+                            
+                            # 凭证使用统计
+                            auth_index = d.get("auth_index", "unknown")
+                            if auth_index not in auth_usage:
+                                auth_usage[auth_index] = {"requests": 0, "tokens": 0, "failed": 0}
+                            auth_usage[auth_index]["requests"] += 1
+                            auth_usage[auth_index]["tokens"] += total_tok
+                            if d.get("failed", False):
+                                auth_usage[auth_index]["failed"] += 1
+                            
+                            # 小时分布
+                            timestamp = str(d.get("timestamp", ""))
                             try:
                                 hour = int(timestamp[11:13])
                                 today_by_hour[hour] += 1
                             except (ValueError, IndexError):
                                 pass
 
-            model_today_stats.sort(key=lambda x: x[1], reverse=True)
-            for model_name, req_count, tok_count, fail_count in model_today_stats[:10]:
+            # 转换为列表并排序
+            model_list = [
+                (name, data["requests"], data["tokens"], data["failed"],
+                 data["input_tokens"], data["output_tokens"], data["reasoning_tokens"], data["cached_tokens"])
+                for name, data in model_aggregated.items()
+            ]
+            model_list.sort(key=lambda x: x[1], reverse=True)
+            
+            for item in model_list[:15]:  # 显示前15个模型
+                model_name, req_count, tok_count, fail_count, in_tok, out_tok, reason_tok, cache_tok = item
                 model_stats.append({
                     "name": model_name,
                     "requests": req_count,
                     "tokens": self._format_tokens(tok_count),
-                    "failed": fail_count
+                    "failed": fail_count,
+                    "input_tokens": in_tok,
+                    "output_tokens": out_tok,
+                    "reasoning_tokens": reason_tok,
+                    "cached_tokens": cache_tok
                 })
 
         # 时段统计
@@ -823,6 +1060,20 @@ class Main(Star):
             {"label": "下午 12-18", "count": sum(today_by_hour[h] for h in range(12, 18))},
             {"label": "晚间 18-24", "count": sum(today_by_hour[h] for h in range(18, 24))}
         ]
+        
+        # 凭证使用统计列表
+        auth_stats = []
+        for auth_id, stats in sorted(auth_usage.items(), key=lambda x: x[1]["requests"], reverse=True)[:10]:
+            auth_stats.append({
+                "auth_index": auth_id,
+                "requests": stats["requests"],
+                "tokens": self._format_tokens(stats["tokens"]),
+                "failed": stats["failed"]
+            })
+
+        # 计算成功率
+        total_failed = sum(m.get("failed", 0) for m in model_stats)
+        success_rate = round((today_requests - total_failed) / today_requests * 100, 1) if today_requests > 0 else 100
 
         return {
             "stats_type": "today",
@@ -830,8 +1081,16 @@ class Main(Star):
             "subtitle": today,
             "today_requests": today_requests,
             "today_tokens": self._format_tokens(today_tokens),
+            "success_rate": success_rate,
             "model_stats": model_stats if model_stats else None,
             "time_slots": time_slots if sum(s["count"] for s in time_slots) > 0 else None,
+            "auth_stats": auth_stats if auth_stats else None,
+            "token_breakdown": {
+                "input": self._format_tokens(total_input_tokens),
+                "output": self._format_tokens(total_output_tokens),
+                "reasoning": self._format_tokens(total_reasoning_tokens),
+                "cached": self._format_tokens(total_cached_tokens)
+            },
             "query_time": datetime.now().strftime("%H:%M:%S")
         }
 
@@ -920,7 +1179,7 @@ class Main(Star):
                     accounts.append(account_data)
                     continue
 
-                # 根据凭证类型选择解析方法
+                # 根据凭证类型选择解析方法（使用动态解析，显示所有模型）
                 if original_provider in ("gemini", "gemini-cli"):
                     # GeminiCLI 使用 buckets 格式
                     buckets = quota_result.get("buckets", [])
@@ -928,7 +1187,7 @@ class Main(Star):
                         account_data["error"] = "无配额信息"
                         accounts.append(account_data)
                         continue
-                    quota_groups = self._parse_gemini_cli_quota(buckets)
+                    quota_groups = self._parse_gemini_cli_quota_dynamic(buckets)
                 else:
                     # Antigravity 使用 models 格式
                     models = quota_result.get("models", {})
@@ -936,7 +1195,7 @@ class Main(Star):
                         account_data["error"] = "无可用模型"
                         accounts.append(account_data)
                         continue
-                    quota_groups = self._parse_quota(models)
+                    quota_groups = self._parse_quota_dynamic(models)
 
                 if not quota_groups:
                     account_data["error"] = "无配额信息"
@@ -1089,7 +1348,7 @@ class Main(Star):
                     lines.append("")
                     continue
 
-                # 根据凭证类型选择解析方法
+                # 根据凭证类型选择解析方法（使用动态解析，显示所有模型）
                 if original_provider in ("gemini", "gemini-cli"):
                     # GeminiCLI 使用 buckets 格式
                     buckets = quota_result.get("buckets", [])
@@ -1097,7 +1356,7 @@ class Main(Star):
                         lines.append("   ⚠️ 无配额信息")
                         lines.append("")
                         continue
-                    quota_groups = self._parse_gemini_cli_quota(buckets)
+                    quota_groups = self._parse_gemini_cli_quota_dynamic(buckets)
                 else:
                     # Antigravity 使用 models 格式
                     models = quota_result.get("models", {})
@@ -1105,7 +1364,7 @@ class Main(Star):
                         lines.append("   ⚠️ 无可用模型")
                         lines.append("")
                         continue
-                    quota_groups = self._parse_quota(models)
+                    quota_groups = self._parse_quota_dynamic(models)
 
                 if not quota_groups:
                     lines.append("   ⚠️ 无配额信息")
@@ -1141,3 +1400,159 @@ class Main(Star):
             await self._client.close()
             self._client = None
         logger.info("CLIProxyAPI 统计插件已终止")
+
+    async def _generate_llm_analysis(self, today_data: Dict[str, Any], 
+                                     quota_data: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        """使用 LLM 生成使用情况分析"""
+        if not self.enable_llm_analysis:
+            return None
+        
+        provider = self._get_llm_provider()
+        if not provider:
+            logger.warning("无法获取 LLM Provider，跳过智能分析")
+            return None
+        
+        try:
+            now = datetime.now()
+            hours_elapsed = now.hour + now.minute / 60
+            
+            # 构建模型统计文本（更详细）
+            model_stats_text = ""
+            total_requests = today_data.get("today_requests", 0)
+            if today_data.get("model_stats"):
+                for m in today_data["model_stats"][:15]:
+                    req_count = m.get('requests', 0)
+                    tokens = m.get('tokens', '0')
+                    failed = m.get('failed', 0)
+                    
+                    # 计算占比
+                    pct = round(req_count / total_requests * 100, 1) if total_requests > 0 else 0
+                    
+                    # 计算平均 Token（如果可能）
+                    avg_tokens = ""
+                    if req_count > 0:
+                        # 尝试解析 tokens 字符串
+                        try:
+                            if 'M' in str(tokens):
+                                tok_num = float(str(tokens).replace('M', '')) * 1_000_000
+                            elif 'K' in str(tokens):
+                                tok_num = float(str(tokens).replace('K', '')) * 1_000
+                            else:
+                                tok_num = float(tokens)
+                            avg = tok_num / req_count
+                            if avg >= 1000:
+                                avg_tokens = f", 平均 {avg/1000:.1f}K/次"
+                            else:
+                                avg_tokens = f", 平均 {int(avg)}/次"
+                        except (ValueError, TypeError):
+                            pass
+                    
+                    fail_info = f", 失败 {failed}" if failed > 0 else ""
+                    model_stats_text += f"- {m['name']}: {req_count} 次 ({pct}%), {tokens} tokens{avg_tokens}{fail_info}\n"
+            else:
+                model_stats_text = "暂无模型使用数据"
+            
+            # 构建配额统计文本（包含刷新时间，更易于分析）
+            quota_stats_text = ""
+            if quota_data and quota_data.get("accounts"):
+                for account in quota_data["accounts"][:8]:
+                    if account.get("quotas"):
+                        email = account.get('email', '未知账号')
+                        quota_stats_text += f"\n账号 {email}:\n"
+                        for q in account["quotas"][:8]:
+                            label = q.get('label', '')
+                            percent = q.get('percent', 0)
+                            reset_time = q.get('reset_time', '未知')
+                            used = 100 - percent
+                            quota_stats_text += f"  - {label}: 剩余 {percent}% (已用 {used}%), 刷新时间: {reset_time}\n"
+            if not quota_stats_text:
+                quota_stats_text = "暂无配额数据"
+            
+            # 构建小时级分布（更精细）
+            hourly_text = ""
+            if today_data.get("time_slots"):
+                for slot in today_data["time_slots"]:
+                    hourly_text += f"- {slot['label']}: {slot['count']} 次\n"
+            else:
+                hourly_text = "暂无时段数据"
+            
+            # 构建 prompt
+            prompt = LLM_ANALYSIS_PROMPT.format(
+                current_time=now.strftime("%Y-%m-%d %H:%M"),
+                date=today_data.get("subtitle", date.today().isoformat()),
+                total_requests=today_data.get("today_requests", 0),
+                total_tokens=today_data.get("today_tokens", "0"),
+                success_rate=today_data.get("success_rate", 100),
+                hours_elapsed=f"{hours_elapsed:.1f}",
+                model_stats=model_stats_text,
+                quota_stats=quota_stats_text,
+                hourly_distribution=hourly_text
+            )
+            
+            # 调用 LLM
+            response = await provider.text_chat(prompt=prompt)
+            if response and response.completion_text:
+                return response.completion_text
+            
+        except Exception as e:
+            logger.error(f"LLM 分析生成失败: {e}")
+        
+        return None
+
+    @filter.command("cpa分析")
+    async def cpa_analysis(self, event: AstrMessageEvent):
+        """查看今日使用情况的 LLM 智能分析"""
+        if not self.enable_llm_analysis:
+            yield event.plain_result("❌ LLM 分析功能未启用，请在插件配置中开启 'enable_llm_analysis'")
+            return
+        
+        client = self._get_client()
+        if not client:
+            yield event.plain_result("❌ 未配置 CLIProxyAPI 地址或密码，请在插件配置中设置")
+            return
+        
+        yield event.plain_result("🔍 正在分析今日使用情况，请稍候...")
+        
+        # 获取今日数据和配额数据
+        today_data = await self._build_today_data(client)
+        quota_data = await self._build_quota_data(client)
+        
+        if not today_data:
+            yield event.plain_result("❌ 获取使用数据失败")
+            return
+        
+        # 生成 LLM 分析
+        analysis = await self._generate_llm_analysis(today_data, quota_data)
+        
+        if analysis:
+            # 构建完整的分析报告
+            report = f"📊 **CLIProxyAPI 今日使用分析**\n"
+            report += f"📅 日期: {today_data.get('subtitle', '')}\n"
+            report += f"📈 请求: {today_data.get('today_requests', 0)} 次 | Token: {today_data.get('today_tokens', '0')}\n"
+            report += f"\n{analysis}"
+            yield event.plain_result(report)
+        else:
+            yield event.plain_result("❌ LLM 分析生成失败，请检查 Provider 配置")
+
+    @filter.command("cpa服务商")
+    async def cpa_providers(self, event: AstrMessageEvent):
+        """列出可用的 LLM 服务商（用于配置 llm_provider_id）"""
+        providers = self._get_available_providers()
+        
+        if not providers:
+            yield event.plain_result("❌ 未找到可用的 LLM 服务商，请先在 AstrBot 中配置提供商")
+            return
+        
+        lines = ["📋 **可用的 LLM 服务商**", ""]
+        lines.append("将以下 ID 填入插件配置的 `llm_provider_id` 字段：")
+        lines.append("")
+        
+        for i, p in enumerate(providers, 1):
+            lines.append(f"  {i}. `{p['id']}`")
+            if p.get('name') and p['name'] != p['id']:
+                lines.append(f"     └─ {p['name']}")
+        
+        lines.append("")
+        lines.append("💡 留空则使用当前对话模型")
+        
+        yield event.plain_result("\n".join(lines))

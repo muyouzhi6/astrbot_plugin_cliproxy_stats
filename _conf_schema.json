@@ -34,5 +34,23 @@
     "type": "bool",
     "hint": "生成更清晰的统计图片（3x 渲染），关闭则使用 2x",
     "default": true
+  },
+  "max_render_antigravity": {
+    "description": "Antigravity 最大渲染数量",
+    "type": "int",
+    "hint": "配额图片中最多显示的 Antigravity 账号数，0 表示不限制",
+    "default": 10
+  },
+  "max_render_gemini_cli": {
+    "description": "GeminiCLI 最大渲染数量",
+    "type": "int",
+    "hint": "配额图片中最多显示的 GeminiCLI 账号数，0 表示不限制",
+    "default": 10
+  },
+  "max_render_codex": {
+    "description": "Codex 最大渲染数量",
+    "type": "int",
+    "hint": "配额图片中最多显示的 Codex 账号数，0 表示不限制",
+    "default": 10
   }
 }

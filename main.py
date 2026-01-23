@@ -510,6 +510,15 @@ class Main(Star):
         self.enable_llm_analysis = self.config.get("enable_llm_analysis", False)
         self.llm_provider_id = self.config.get("llm_provider_id", "")
         self.high_res_render = self.config.get("high_res_render", True)
+        
+        # 各凭证类型最大渲染数量配置（0 表示不限制）
+        self.max_render_count: Dict[str, int] = {
+            "antigravity": int(self.config.get("max_render_antigravity", 10) or 10),
+            "gemini-cli": int(self.config.get("max_render_gemini_cli", 10) or 10),
+            "codex": int(self.config.get("max_render_codex", 10) or 10)
+        }
+        logger.info(f"max_render_count 配置: {self.max_render_count}")
+        
         self._client: Optional[CPAClient] = None
         self._renderer: Optional[StatsCardRenderer] = None
 
@@ -1435,7 +1444,8 @@ class Main(Star):
             "subtitle": " | ".join(provider_summary) if provider_summary else "无账号",
             "accounts": accounts,
             "provider_groups": list(provider_groups.keys()),
-            "query_time": datetime.now().strftime("%H:%M:%S")  # 添加查询时间用于调试
+            "query_time": datetime.now().strftime("%H:%M:%S"),  # 添加查询时间用于调试
+            "max_render_count": self.max_render_count  # 传递给渲染器的截断配置
         }
 
     async def _get_overview(self, client: CPAClient) -> str:
@@ -1490,8 +1500,18 @@ class Main(Star):
             provider_info = PROVIDER_INFO.get(provider, {"name": provider.title(), "icon": "📦"})
             lines.append(f"━━━ {provider_info['icon']} {provider_info['name']} ━━━")
             lines.append("")
+            
+            # 应用截断限制
+            config_key = "gemini-cli" if provider == "gemini" else provider
+            max_count = self.max_render_count.get(config_key, 0)
+            truncated_count = 0
+            if max_count > 0 and len(auths) > max_count:
+                truncated_count = len(auths) - max_count
+                auths_to_show = auths[:max_count]
+            else:
+                auths_to_show = auths
 
-            for auth in auths:
+            for auth in auths_to_show:
                 auth_index = auth.get("auth_index", "")
                 email = auth.get("email", "")
                 name = auth.get("name", auth.get("id", "未知"))
@@ -1591,6 +1611,11 @@ class Main(Star):
 
                     lines.append(f"   {status_icon} {label}: {percent}% | 刷新: {reset_time}")
 
+                lines.append("")
+
+            # 显示截断提示
+            if truncated_count > 0:
+                lines.append(f"   ⋯ 还有 {truncated_count} 个 {provider_info['name']} 账号未显示")
                 lines.append("")
 
         lines.append("💡 配额每日自动刷新，百分比为剩余额度")

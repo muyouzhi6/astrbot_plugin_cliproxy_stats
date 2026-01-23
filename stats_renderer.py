@@ -650,12 +650,22 @@ class StatsCardRenderer:
 
         return self._downscale_image(img)
 
-    def render_quota(self, data: Dict[str, Any]) -> Image.Image:
-        """渲染配额状态卡片（两列布局，更宽更短）"""
+    def render_quota(self, data: Dict[str, Any], max_render_count: Optional[Dict[str, int]] = None) -> Image.Image:
+        """渲染配额状态卡片（两列布局，更宽更短）
+        
+        Args:
+            data: 配额数据，可包含 max_render_count 字段
+            max_render_count: 各 provider 最大渲染数量，如 {"antigravity": 5, "gemini-cli": 10, "codex": 10}
+                             0 或不存在表示不限制。也可以从 data["max_render_count"] 读取。
+        """
         base_width = 880  # 加宽以支持两列
         scale = self.SCALE_FACTOR
         
         accounts = data.get("accounts", [])
+        
+        # 优先使用参数传入的配置，其次从 data 中读取
+        if max_render_count is None:
+            max_render_count = data.get("max_render_count")
         
         # 计算每个账号需要的高度
         def calc_account_height(account: Dict[str, Any]) -> int:
@@ -673,6 +683,17 @@ class StatsCardRenderer:
                 provider_accounts[provider] = []
             provider_accounts[provider].append(account)
         
+        # 应用截断限制并记录截断数量
+        truncated_counts: Dict[str, int] = {}
+        if max_render_count:
+            for provider in provider_accounts:
+                # 使用标准化的 key: gemini -> gemini-cli
+                config_key = "gemini-cli" if provider == "gemini" else provider
+                max_count = max_render_count.get(config_key, 0)
+                if max_count > 0 and len(provider_accounts[provider]) > max_count:
+                    truncated_counts[provider] = len(provider_accounts[provider]) - max_count
+                    provider_accounts[provider] = provider_accounts[provider][:max_count]
+        
         # 计算总高度（两列布局）
         base_height = 90  # 标题区域
         for provider, accs in provider_accounts.items():
@@ -684,6 +705,9 @@ class StatsCardRenderer:
                 right_height = calc_account_height(accs[i + 1]) if i + 1 < len(accs) else 0
                 row_heights.append(max(left_height, right_height) + 16)  # 行间距
             base_height += sum(row_heights)
+            # 如果有截断，添加提示行高度
+            if provider in truncated_counts:
+                base_height += 32
             base_height += 12  # 分组间距
         base_height += 50  # 底部提示
         
@@ -756,6 +780,13 @@ class StatsCardRenderer:
                                              font_medium, font_small, font_tiny)
                 
                 y += row_height + 14 * scale
+            
+            # 如果有截断，显示提示信息
+            if provider in truncated_counts:
+                truncated_text = f"⋯ 还有 {truncated_counts[provider]} 个 {provider_name} 账号未显示"
+                draw.text((padding, y), truncated_text,
+                         fill=self.COLORS["text_muted"], font=font_small)
+                y += 28 * scale
             
             y += 8 * scale  # 凭证类型分组间距
         
@@ -877,6 +908,17 @@ class StatsCardRenderer:
             if provider not in provider_groups:
                 provider_groups[provider] = []
             provider_groups[provider].append(account)
+        
+        # 应用截断限制（从 quota_data 中获取配置）
+        max_render_count = quota_data.get("max_render_count")
+        truncated_counts: Dict[str, int] = {}
+        if max_render_count:
+            for provider in provider_groups:
+                config_key = "gemini-cli" if provider == "gemini" else provider
+                max_count = max_render_count.get(config_key, 0)
+                if max_count > 0 and len(provider_groups[provider]) > max_count:
+                    truncated_counts[provider] = len(provider_groups[provider]) - max_count
+                    provider_groups[provider] = provider_groups[provider][:max_count]
         
         # 使用足够大的画布（后续裁剪）
         max_height = 5000
@@ -1050,6 +1092,13 @@ class StatsCardRenderer:
                     y += 16 * scale
                 
                 y += 6 * scale
+            
+            # 显示截断提示
+            if provider in truncated_counts:
+                truncated_text = f"⋯ 还有 {truncated_counts[provider]} 个账号未显示"
+                draw.text((padding + 28 * scale, y), truncated_text,
+                         fill=self.COLORS["text_muted"], font=font_tiny)
+                y += 18 * scale
             
             y += 8 * scale
         

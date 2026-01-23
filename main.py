@@ -89,8 +89,15 @@ GEMINI_CLI_REQUEST_HEADERS = {
     "Client-Metadata": "ideType=IDE_UNSPECIFIED,platform=PLATFORM_UNSPECIFIED,pluginType=GEMINI"
 }
 
+# Codex (OpenAI) 配额查询 API
+CODEX_QUOTA_URL = "https://chatgpt.com/backend-api/wham/usage"
+CODEX_QUOTA_HEADERS = {
+    "Authorization": "Bearer $TOKEN$",
+    "Content-Type": "application/json"
+}
+
 # 支持配额查询的凭证类型 (gemini-cli 是 CPA 内部转换后的名称)
-QUOTA_SUPPORTED_PROVIDERS = ["antigravity", "gemini", "gemini-cli"]
+QUOTA_SUPPORTED_PROVIDERS = ["antigravity", "gemini", "gemini-cli", "codex"]
 
 # 模型分组配置 (Antigravity 格式)
 QUOTA_GROUPS = [
@@ -118,7 +125,7 @@ PROVIDER_INFO = {
     "gemini": {"name": "GeminiCLI", "icon": "💎", "color": "#3b82f6", "supports_quota": True},
     "gemini-cli": {"name": "GeminiCLI", "icon": "💎", "color": "#3b82f6", "supports_quota": True},
     "claude": {"name": "Claude", "icon": "🤖", "color": "#f59e0b", "supports_quota": False},
-    "codex": {"name": "Codex", "icon": "🔮", "color": "#10b981", "supports_quota": False},
+    "codex": {"name": "Codex", "icon": "🔮", "color": "#10b981", "supports_quota": True},
     "iflow": {"name": "iFlow", "icon": "🌊", "color": "#06b6d4", "supports_quota": False},
     "qwen": {"name": "Qwen", "icon": "🌙", "color": "#ec4899", "supports_quota": False}
 }
@@ -406,6 +413,88 @@ class CPAClient:
             "success": False,
             "error": last_error or "获取配额失败",
             "error_code": last_status_code or 0
+        }
+
+    async def get_codex_quota(self, auth_index: str) -> Dict[str, Any]:
+        """获取 Codex (OpenAI) 账号的配额信息
+
+        Args:
+            auth_index: 凭证索引
+
+        Returns:
+            Dict with keys:
+                - "success": bool - 是否成功
+                - "rate_limit": Dict - 配额信息（仅在成功时存在）
+                    - "primary_window": Dict - 日限额（5小时窗口）
+                    - "secondary_window": Dict - 周限额（7天窗口）
+                - "plan_type": str - 计划类型（如 "team"）
+                - "error": str - 错误信息（仅在失败时存在）
+                - "error_code": int - HTTP 错误码（仅在失败时存在）
+        """
+        result = await self.api_call(
+            auth_index=auth_index,
+            method="GET",
+            url=CODEX_QUOTA_URL,
+            header=CODEX_QUOTA_HEADERS,
+            data=""
+        )
+
+        if result:
+            status_code = result.get("status_code", 0)
+            if status_code == 200:
+                body = result.get("body", {})
+                # body 可能是字符串，需要解析
+                if isinstance(body, str):
+                    try:
+                        body = json.loads(body)
+                    except json.JSONDecodeError:
+                        body = {}
+                
+                if isinstance(body, dict) and "rate_limit" in body:
+                    return {
+                        "success": True,
+                        "rate_limit": body.get("rate_limit", {}),
+                        "plan_type": body.get("plan_type", "unknown"),
+                        "code_review_rate_limit": body.get("code_review_rate_limit"),
+                        "credits": body.get("credits")
+                    }
+                return {
+                    "success": False,
+                    "error": "响应格式无效",
+                    "error_code": 0
+                }
+            elif status_code == 401:
+                return {
+                    "success": False,
+                    "error": "认证失败，Token 可能已过期",
+                    "error_code": 401
+                }
+            elif status_code == 403:
+                return {
+                    "success": False,
+                    "error": "权限不足",
+                    "error_code": 403
+                }
+            else:
+                body = result.get("body", {})
+                if isinstance(body, str):
+                    try:
+                        body = json.loads(body)
+                    except json.JSONDecodeError:
+                        body = {}
+                error_msg = f"HTTP {status_code}"
+                if isinstance(body, dict) and "error" in body:
+                    error_msg = body.get("error", {}).get("message", error_msg) if isinstance(body.get("error"), dict) else str(body.get("error", error_msg))
+                return {
+                    "success": False,
+                    "error": error_msg,
+                    "error_code": status_code
+                }
+
+        return {
+            "success": False,
+            "error": "获取配额失败",
+            "error_code": 0
         }
 
 
@@ -749,6 +838,82 @@ class Main(Star):
             return local_dt.strftime("%m/%d %H:%M")
         except Exception:
             return reset_time[:16] if len(reset_time) > 16 else reset_time
+
+    def _format_codex_reset_time(self, reset_at: Optional[int]) -> str:
+        """格式化 Codex 配额刷新时间（Unix 时间戳转本地时间）"""
+        if not reset_at:
+            return "-"
+        try:
+            dt = datetime.fromtimestamp(reset_at)
+            return dt.strftime("%m/%d %H:%M")
+        except Exception:
+            return str(reset_at)
+
+    def _parse_codex_quota(self, rate_limit: Dict[str, Any], plan_type: str = "unknown") -> List[Dict[str, Any]]:
+        """解析 Codex (OpenAI) 配额信息
+
+        Args:
+            rate_limit: API 返回的 rate_limit 对象，包含 primary_window 和 secondary_window
+            plan_type: 计划类型（如 "team"）
+
+        Returns:
+            配额分组列表，格式与其他 provider 一致
+        """
+        quotas = []
+
+        # 处理 primary_window（日限额/5小时窗口）
+        primary = rate_limit.get("primary_window")
+        if primary:
+            used_percent = primary.get("used_percent", 0)
+            remaining_percent = 100 - used_percent
+            reset_at = primary.get("reset_at")
+            window_seconds = primary.get("limit_window_seconds", 0)
+            
+            # 根据窗口时间确定标签
+            if window_seconds <= 21600:  # 6小时以内
+                label = "日限额"
+            else:
+                label = "主限额"
+            
+            quotas.append({
+                "id": "codex-primary",
+                "label": label,
+                "remaining_percent": remaining_percent,
+                "reset_time": reset_at,
+                "reset_time_formatted": self._format_codex_reset_time(reset_at),
+                "window_seconds": window_seconds,
+                "models": ["codex"],
+                "is_codex": True
+            })
+
+        # 处理 secondary_window（周限额）
+        secondary = rate_limit.get("secondary_window")
+        if secondary:
+            used_percent = secondary.get("used_percent", 0)
+            remaining_percent = 100 - used_percent
+            reset_at = secondary.get("reset_at")
+            window_seconds = secondary.get("limit_window_seconds", 0)
+            
+            # 根据窗口时间确定标签
+            if window_seconds >= 604800:  # 7天
+                label = "周限额"
+            else:
+                label = "次限额"
+            
+            quotas.append({
+                "id": "codex-secondary",
+                "label": label,
+                "remaining_percent": remaining_percent,
+                "reset_time": reset_at,
+                "reset_time_formatted": self._format_codex_reset_time(reset_at),
+                "window_seconds": window_seconds,
+                "models": ["codex"],
+                "is_codex": True
+            })
+
+        # 按剩余配额排序（低的在前，便于关注）
+        quotas.sort(key=lambda x: x["remaining_percent"])
+        return quotas
 
     @filter.command("cpa")
     async def cpa_stats(self, event: AstrMessageEvent):
@@ -1163,10 +1328,17 @@ class Main(Star):
                     accounts.append(account_data)
                     continue
 
-                # 获取配额信息（使用通用方法，传递原始 provider 类型和文件名）
+                # 获取配额信息（根据 provider 类型选择不同的 API）
                 logger.debug(f"正在获取配额: provider={original_provider}, name={name}, auth_index={auth_index}")
-                quota_result = await client.get_google_quota(auth_index, original_provider, name)
-                logger.debug(f"配额获取结果: success={quota_result.get('success')}, buckets={len(quota_result.get('buckets', []))}, models={len(quota_result.get('models', {}))}")
+                
+                if original_provider == "codex":
+                    # Codex 使用专用的配额查询 API
+                    quota_result = await client.get_codex_quota(auth_index)
+                    logger.debug(f"Codex 配额获取结果: success={quota_result.get('success')}, rate_limit={quota_result.get('rate_limit') is not None}")
+                else:
+                    # Antigravity/GeminiCLI 使用 Google Cloud Code API
+                    quota_result = await client.get_google_quota(auth_index, original_provider, name)
+                    logger.debug(f"配额获取结果: success={quota_result.get('success')}, buckets={len(quota_result.get('buckets', []))}, models={len(quota_result.get('models', {}))}")
 
                 if not quota_result.get("success"):
                     # 根据错误码显示不同的错误信息
@@ -1180,7 +1352,16 @@ class Main(Star):
                     continue
 
                 # 根据凭证类型选择解析方法（使用动态解析，显示所有模型）
-                if original_provider in ("gemini", "gemini-cli"):
+                if original_provider == "codex":
+                    # Codex 使用 rate_limit 格式
+                    rate_limit = quota_result.get("rate_limit", {})
+                    if not rate_limit:
+                        account_data["error"] = "无配额信息"
+                        accounts.append(account_data)
+                        continue
+                    plan_type = quota_result.get("plan_type", "unknown")
+                    quota_groups = self._parse_codex_quota(rate_limit, plan_type)
+                elif original_provider in ("gemini", "gemini-cli"):
                     # GeminiCLI 使用 buckets 格式
                     buckets = quota_result.get("buckets", [])
                     if not buckets:
@@ -1204,8 +1385,13 @@ class Main(Star):
 
                 for group in quota_groups:
                     percent = group["remaining_percent"]
-                    reset_time = self._format_reset_time(group.get("reset_time"))
                     label = group["label"]
+                    
+                    # 根据是否为 Codex 选择不同的时间格式化方法
+                    if group.get("is_codex"):
+                        reset_time = group.get("reset_time_formatted", "-")
+                    else:
+                        reset_time = self._format_reset_time(group.get("reset_time"))
 
                     # 配额状态
                     if percent >= 80:
@@ -1336,8 +1522,11 @@ class Main(Star):
                     lines.append("")
                     continue
 
-                # 获取配额信息（使用原始 provider 类型和文件名）
-                quota_result = await client.get_google_quota(auth_index, original_provider, name)
+                # 获取配额信息（根据 provider 类型选择不同的 API）
+                if original_provider == "codex":
+                    quota_result = await client.get_codex_quota(auth_index)
+                else:
+                    quota_result = await client.get_google_quota(auth_index, original_provider, name)
 
                 if not quota_result.get("success"):
                     error_code = quota_result.get("error_code", 0)
@@ -1349,7 +1538,16 @@ class Main(Star):
                     continue
 
                 # 根据凭证类型选择解析方法（使用动态解析，显示所有模型）
-                if original_provider in ("gemini", "gemini-cli"):
+                if original_provider == "codex":
+                    # Codex 使用 rate_limit 格式
+                    rate_limit = quota_result.get("rate_limit", {})
+                    if not rate_limit:
+                        lines.append("   ⚠️ 无配额信息")
+                        lines.append("")
+                        continue
+                    plan_type = quota_result.get("plan_type", "unknown")
+                    quota_groups = self._parse_codex_quota(rate_limit, plan_type)
+                elif original_provider in ("gemini", "gemini-cli"):
                     # GeminiCLI 使用 buckets 格式
                     buckets = quota_result.get("buckets", [])
                     if not buckets:
@@ -1373,8 +1571,13 @@ class Main(Star):
 
                 for group in quota_groups:
                     percent = group["remaining_percent"]
-                    reset_time = self._format_reset_time(group.get("reset_time"))
                     label = group["label"]
+                    
+                    # 根据是否为 Codex 选择不同的时间格式化方法
+                    if group.get("is_codex"):
+                        reset_time = group.get("reset_time_formatted", "-")
+                    else:
+                        reset_time = self._format_reset_time(group.get("reset_time"))
 
                     # 配额百分比颜色提示
                     if percent >= 80:
